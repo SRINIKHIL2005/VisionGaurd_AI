@@ -1,0 +1,9 @@
+# Data directory for storing face database and outputs
+# This directory will be created automatically
+
+# Folder structure:
+# data/
+# ├── face_database/       # Face recognition embeddings
+# │   └── face_embeddings.pkl
+# ├── uploads/             # Temporary uploads
+# └── outputs/             # Analysis results

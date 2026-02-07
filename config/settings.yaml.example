@@ -1,0 +1,142 @@
+# VisionGuard AI Configuration
+
+# ===== Model Paths & Settings =====
+models:
+  deepfake:
+    name: "dima806/deepfake_vs_real_image_detection"
+    type: "huggingface"
+    threshold: 0.35  # Lowered from 0.5 - detects more AI-generated content
+    device: "auto"
+    gemini_api_key: "YOUR_GEMINI_API_KEY_HERE"  # REQUIRED for image deepfake detection
+    use_gemini_for_images: true  # Use ONLY Gemini for IMAGE analysis (not video)
+    
+  face_recognition:
+    name: "arcface_r100_v1"
+    type: "insightface"
+    similarity_threshold: 0.5
+    device: "auto"
+    database_path: "./data/face_database"
+    
+  object_detection:
+    name: "yolov8n.pt"  # nano model (fastest)
+    type: "ultralytics"
+    confidence: 0.35  # Increased from 0.25 - filters low confidence detections
+    iou_threshold: 0.50  # Increased from 0.45 - reduces duplicate boxes
+    device: "auto"
+    classes: null  # null = all classes, or list like [0, 1, 2]
+    # Image preprocessing settings (NEW - improves accuracy)
+    imgsz: 640  # Input image size (640, 800, 1024) - larger = more accurate
+    max_det: 300  # Maximum detections per image
+    agnostic_nms: false  # Class-agnostic NMS
+    # Weapon detection model (optional - place custom model and update path)
+    weapon_model: "./Learning/weapon_training/weapon_detector_v1/weights/best.pt"  # Custom trained weapon detector
+
+
+# ===== Risk Assessment =====
+risk_assessment:
+  weights:
+    deepfake_score: 0.4
+    face_recognition_score: 0.3
+    object_detection_score: 0.3
+  
+  risk_levels:
+    low: 0.3
+    medium: 0.6
+    high: 0.75  # Lowered from 0.8 for better weapon detection
+  
+  suspicious_objects:
+    - "Knife"
+    - "Grenade"
+    - "Pistol"
+    - "Rifle"
+    - "knife"
+    - "gun"
+    - "weapon"
+    - "mask"
+    - "cell phone"  # in restricted areas
+  
+  weapon_objects:  # Specific list for weapon matching
+    - "Knife"
+    - "Grenade"
+    - "Pistol"
+    - "Rifle"
+    - "knife"
+    - "gun"
+    - "weapon"
+    - "pistol"
+    - "rifle"
+    - "handgun"
+    - "firearm"
+
+# ===== Input Processing =====
+input:
+  image:
+    max_size: [1920, 1080]
+    allowed_formats: ["jpg", "jpeg", "png", "bmp"]
+  
+  video:
+    max_fps: 30
+    max_duration: 300  # seconds
+    frame_skip: 5  # process every Nth frame
+    allowed_formats: ["mp4", "avi", "mov"]
+  
+  camera:
+    default_fps: 15
+    resolution: [640, 480]
+
+# ===== Output Settings =====
+output:
+  save_results: true
+  output_dir: "./outputs"
+  save_visualizations: true
+  json_format: true
+  include_timestamps: true
+  
+  visualization:
+    bbox_thickness: 2
+    font_scale: 0.6
+    show_confidence: true
+
+# ===== API Settings =====
+api:
+  host: "0.0.0.0"
+  port: 8000
+  reload: true
+  workers: 1
+  max_upload_size: 50  # MB
+  cors_origins:
+    - "*"
+
+# ===== UI Settings =====
+ui:
+  title: "VisionGuard AI"
+  theme: "dark"
+  sidebar_state: "expanded"
+  max_file_size: 200  # MB
+  
+# ===== Logging =====
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "./logs/visionguard.log"
+  console: true
+
+# ===== Performance =====
+performance:
+  batch_size: 1
+  num_threads: 4
+  enable_gpu: true
+  mixed_precision: false
+  cache_models: true
+
+# ===== Telegram Notifications =====
+telegram:
+  enabled: false  # Set to true after configuration
+  bot_token: "YOUR_TELEGRAM_BOT_TOKEN"  # Your Telegram bot token from @BotFather
+  owner_chat_id: YOUR_CHAT_ID  # Your Telegram chat ID (numeric)
+  cooldown_minutes: 3  # Wait time before re-notifying same face
+  retention_days: 10  # Keep unknown face images for X days
+  camera_locations:  # Optional: Map camera IDs to friendly names
+    cam1: "Front Door"
+    cam2: "Back Entrance"
+    cam3: "Main Hall"

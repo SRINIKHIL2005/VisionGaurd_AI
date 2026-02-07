@@ -1,0 +1,96 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Model files
+*.pt
+*.pth
+*.onnx
+*.h5
+*.pb
+models/pretrained/
+weights/
+
+# Data files
+data/uploads/*
+data/outputs/*
+data/face_database/*.pkl
+data/face_database/unknown_images/*
+data/face_database/unknown_queue.json
+!data/.gitkeep
+!logs/.gitkeep
+
+# Training runs
+runs/
+Learning/runs/
+
+# Logs
+*.log
+logs/*.log
+logs/*
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Environment variables
+.env
+.env.local
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+frontend/.vite/
+
+# API Keys and Secrets (template: settings.yaml.example)
+config/settings.yaml
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Test files
+test_*.jpg
+test_*.png
+test_*.mp4
+
+# Cache
+.cache/
+*.cache
