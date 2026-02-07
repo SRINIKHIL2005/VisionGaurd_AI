@@ -65,7 +65,20 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### Step 5: Verify Installation
+### Step 5: Configure Settings
+```bash
+# Copy the example configuration file
+cp config/settings.yaml.example config/settings.yaml
+
+# Edit config/settings.yaml and add:
+# - Your Gemini API key (for deepfake detection)
+# - Your Telegram bot token (optional, for notifications)
+# - Your Telegram chat ID (optional)
+```
+
+**Important:** Never commit `config/settings.yaml` with your API keys - it's already in `.gitignore`.
+
+### Step 6: Verify Installation
 ```bash
 # Check if PyTorch is installed correctly
 python -c "import torch; print(f'PyTorch: {torch.__version__}')"
@@ -74,7 +87,7 @@ python -c "import torch; print(f'PyTorch: {torch.__version__}')"
 python -c "import torch; print(f'CUDA Available: {torch.cuda.is_available()}')"
 ```
 
-### Step 6: Run the Application
+### Step 7: Run the Application
 
 **Option 1: FastAPI Backend**
 ```bash
