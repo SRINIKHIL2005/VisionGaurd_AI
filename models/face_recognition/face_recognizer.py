@@ -48,6 +48,7 @@ class FaceRecognizer:
     """
     Face recognition using InsightFace ArcFace model.
     Handles face detection, embedding extraction, and identity matching.
+    Supports both pickle file storage and MongoDB.
     """
     
     def __init__(
@@ -55,20 +56,24 @@ class FaceRecognizer:
         model_name: str = 'buffalo_l',
         database_path: str = './data/face_database',
         similarity_threshold: float = 0.5,
-        device: str = 'auto'
+        device: str = 'auto',
+        mongodb_manager=None
     ):
         """
         Initialize face recognizer with ArcFace model.
         
         Args:
             model_name: InsightFace model name ('buffalo_l', 'buffalo_s', 'antelopev2')
-            database_path: Path to store/load face embeddings database
+            database_path: Path to store/load face embeddings database (pickle file)
             similarity_threshold: Minimum similarity score for match (0-1)
             device: 'auto', 'cuda', or 'cpu'
+            mongodb_manager: Optional MongoDBManager instance for database storage
         """
         self.database_path = database_path
         self.similarity_threshold = similarity_threshold
         self.face_database = {}
+        self.mongodb_manager = mongodb_manager
+        self.use_mongodb = mongodb_manager is not None
         
         # Determine device
         if device == 'auto':
@@ -78,6 +83,10 @@ class FaceRecognizer:
             self.device = device
         
         print(f"🔧 Initializing Face Recognizer on {self.device}...")
+        if self.use_mongodb:
+            print(f"   Database: MongoDB")
+        else:
+            print(f"   Database: Pickle file ({database_path})")
         
         if not INSIGHTFACE_AVAILABLE:
             print("❌ InsightFace not installed. Using fallback detector.")
@@ -109,48 +118,59 @@ class FaceRecognizer:
         self.app = None
     
     def _load_database(self):
-        """Load face embeddings database from disk"""
-        os.makedirs(self.database_path, exist_ok=True)
-        db_file = os.path.join(self.database_path, 'face_embeddings.pkl')
-        
-        if os.path.exists(db_file):
-            with open(db_file, 'rb') as f:
-                loaded_data = pickle.load(f)
-                
-            # Handle migration from old format (embedding only) to new format (with metadata)
-            if loaded_data and isinstance(list(loaded_data.values())[0], np.ndarray):
-                # Old format: {name: embedding} -> Migrate to new format
-                print("📦 Migrating database to new format with metadata...")
-                from datetime import datetime
-                migration_date = datetime.now().isoformat()
-                self.face_database = {}
-                for name, embedding in loaded_data.items():
-                    self.face_database[name] = {
-                        'embedding': embedding,
-                        'metadata': {
-                            'added_date': migration_date,  # Use current time as migration timestamp
-                            'photo_path': None,
-                            'approved_by': 'Legacy (Migrated)',
-                            'camera_location': 'Pre-migration data'
-                        }
-                    }
-                self._save_database()  # Save migrated format
-                print(f"✅ Migrated {len(self.face_database)} identities with timestamp {migration_date}")
-            else:
-                self.face_database = loaded_data
-                
-            print(f"📂 Loaded {len(self.face_database)} identities from database")
+        """Load face embeddings database from MongoDB or disk"""
+        if self.use_mongodb:
+            # Load from MongoDB
+            self.face_database = self.mongodb_manager.get_all_faces()
+            print(f"📂 Loaded {len(self.face_database)} identities from MongoDB")
         else:
-            print("📂 No existing database found. Starting fresh.")
+            # Load from pickle file
+            os.makedirs(self.database_path, exist_ok=True)
+            db_file = os.path.join(self.database_path, 'face_embeddings.pkl')
+            
+            if os.path.exists(db_file):
+                with open(db_file, 'rb') as f:
+                    loaded_data = pickle.load(f)
+                    
+                # Handle migration from old format (embedding only) to new format (with metadata)
+                if loaded_data and isinstance(list(loaded_data.values())[0], np.ndarray):
+                    # Old format: {name: embedding} -> Migrate to new format
+                    print("📦 Migrating database to new format with metadata...")
+                    from datetime import datetime
+                    migration_date = datetime.now().isoformat()
+                    self.face_database = {}
+                    for name, embedding in loaded_data.items():
+                        self.face_database[name] = {
+                            'embedding': embedding,
+                            'metadata': {
+                                'added_date': migration_date,
+                                'photo_path': None,
+                                'approved_by': 'Legacy (Migrated)',
+                                'camera_location': 'Pre-migration data'
+                            }
+                        }
+                    self._save_database()  # Save migrated format
+                    print(f"✅ Migrated {len(self.face_database)} identities with timestamp {migration_date}")
+                else:
+                    self.face_database = loaded_data
+                    
+                print(f"📂 Loaded {len(self.face_database)} identities from database")
+            else:
+                print("📂 No existing database found. Starting fresh.")
     
     def _save_database(self):
-        """Save face embeddings database to disk"""
-        os.makedirs(self.database_path, exist_ok=True)
-        db_file = os.path.join(self.database_path, 'face_embeddings.pkl')
-        
-        with open(db_file, 'wb') as f:
-            pickle.dump(self.face_database, f)
-        print(f"💾 Database saved with {len(self.face_database)} identities")
+        """Save face embeddings database to MongoDB or disk"""
+        if self.use_mongodb:
+            # MongoDB saves automatically during add/remove operations
+            pass
+        else:
+            # Save to pickle file
+            os.makedirs(self.database_path, exist_ok=True)
+            db_file = os.path.join(self.database_path, 'face_embeddings.pkl')
+            
+            with open(db_file, 'wb') as f:
+                pickle.dump(self.face_database, f)
+            print(f"💾 Database saved with {len(self.face_database)} identities")
     
     def preprocess_image(self, image: Union[np.ndarray, Image.Image]) -> np.ndarray:
         """
@@ -244,13 +264,26 @@ class FaceRecognizer:
                 'camera_location': 'Unknown'
             }
         
-        self.face_database[name] = {
-            'embedding': embedding,
-            'metadata': metadata
-        }
-        self._save_database()
-        print(f"✅ Added {name} to database with metadata")
-        return True
+        if self.use_mongodb:
+            # Save to MongoDB
+            success = self.mongodb_manager.add_face(name, embedding, metadata)
+            if success:
+                # Update local cache
+                self.face_database[name] = {
+                    'embedding': embedding,
+                    'metadata': metadata
+                }
+                print(f"✅ Added {name} to MongoDB")
+            return success
+        else:
+            # Save to pickle file
+            self.face_database[name] = {
+                'embedding': embedding,
+                'metadata': metadata
+            }
+            self._save_database()
+            print(f"✅ Added {name} to database with metadata")
+            return True
     
     def add_identity(self, image: Union[np.ndarray, Image.Image], name: str) -> bool:
         """
@@ -413,10 +446,20 @@ class FaceRecognizer:
     def remove_identity(self, name: str) -> bool:
         """Remove an identity from the database"""
         if name in self.face_database:
-            del self.face_database[name]
-            self._save_database()
-            print(f"🗑️ Removed {name} from database")
-            return True
+            if self.use_mongodb:
+                # Remove from MongoDB
+                success = self.mongodb_manager.remove_face(name)
+                if success:
+                    # Update local cache
+                    del self.face_database[name]
+                    print(f"✅ Removed {name} from MongoDB")
+                return success
+            else:
+                # Remove from pickle file
+                del self.face_database[name]
+                self._save_database()
+                print(f"✅ Removed {name} from database")
+                return True
         return False
     
     def list_identities(self, detailed: bool = False) -> Union[List[str], List[Dict]]:
@@ -429,6 +472,11 @@ class FaceRecognizer:
         Returns:
             List of names or list of dicts with full info
         """
+        if self.use_mongodb:
+            # Query directly from MongoDB for fresh data
+            return self.mongodb_manager.list_identities(detailed=detailed)
+        
+        # Use local pickle database
         if not detailed:
             return list(self.face_database.keys())
         

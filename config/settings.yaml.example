@@ -140,3 +140,17 @@ telegram:
     cam1: "Front Door"
     cam2: "Back Entrance"
     cam3: "Main Hall"
+
+# ===== MongoDB Configuration =====
+mongodb:
+  enabled: false  # Set to true to use MongoDB instead of local pickle files
+  connection_string: "mongodb://localhost:27017/"  # Your MongoDB connection string (mongodb+srv://... for Atlas)
+  database_name: "visionguard_ai"  # Database name
+  # When enabled, all data will be stored in MongoDB:
+  # - Face database with embeddings
+  # - Detection history
+  # - Telegram interactions
+  # - Analysis history
+  # - User actions
+  # See setup_mongodb.md for detailed setup instructions
+

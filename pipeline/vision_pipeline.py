@@ -88,6 +88,25 @@ class VisionPipeline:
     
     def _init_modules(self):
         """Initialize all AI modules"""
+        # Initialize MongoDB if enabled
+        mongodb_config = self.config.get('mongodb', {})
+        self.mongodb_manager = None
+        
+        if mongodb_config.get('enabled', False):
+            try:
+                from utils.mongodb_manager import MongoDBManager
+                connection_string = mongodb_config.get('connection_string')
+                database_name = mongodb_config.get('database_name', 'visionguard_ai')
+                
+                if connection_string:
+                    self.mongodb_manager = MongoDBManager(connection_string, database_name)
+                    print("✅ MongoDB initialized and ready")
+                else:
+                    print("⚠️ MongoDB enabled but connection_string not provided")
+            except Exception as e:
+                print(f"⚠️ Failed to initialize MongoDB: {e}")
+                print("   Falling back to local pickle database")
+        
         # 1. Deepfake Detector
         print("\n1️⃣ Loading Deepfake Detector...")
         deepfake_config = self.config['models']['deepfake']
@@ -111,7 +130,9 @@ class VisionPipeline:
         print("\n2️⃣ Loading Face Recognizer...")
         face_config = self.config['models'].get('face_recognition', {})
         self.face_recognizer = FaceRecognizer(
-            similarity_threshold=face_config.get('similarity_threshold', 0.6)
+            similarity_threshold=face_config.get('similarity_threshold', 0.6),
+            database_path=face_config.get('database_path', './data/face_database'),
+            mongodb_manager=self.mongodb_manager
         )
         
         # 3. Object Detector

@@ -688,6 +688,116 @@ async def telegram_status():
     }
 
 
+# ===== MongoDB History Endpoints =====
+
+@app.get("/history/detections", tags=["History"])
+async def get_detection_history(
+    limit: int = 100,
+    camera_location: Optional[str] = None
+):
+    """
+    Get detection history from MongoDB.
+    
+    Args:
+        limit: Maximum number of records to return
+        camera_location: Filter by camera location (optional)
+        
+    Returns:
+        List of detection events
+    """
+    if pipeline is None:
+        raise HTTPException(status_code=503, detail="Pipeline not initialized")
+    
+    if not hasattr(pipeline, 'mongodb_manager') or pipeline.mongodb_manager is None:
+        raise HTTPException(status_code=503, detail="MongoDB not enabled")
+    
+    try:
+        history = pipeline.mongodb_manager.get_detection_history(
+            limit=limit,
+            camera_location=camera_location
+        )
+        return {
+            "total": len(history),
+            "history": history
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching history: {str(e)}")
+
+
+@app.get("/history/telegram", tags=["History"])
+async def get_telegram_history(limit: int = 100):
+    """Get Telegram interaction history from MongoDB"""
+    if pipeline is None:
+        raise HTTPException(status_code=503, detail="Pipeline not initialized")
+    
+    if not hasattr(pipeline, 'mongodb_manager') or pipeline.mongodb_manager is None:
+        raise HTTPException(status_code=503, detail="MongoDB not enabled")
+    
+    try:
+        history = pipeline.mongodb_manager.get_telegram_history(limit=limit)
+        return {
+            "total": len(history),
+            "history": history
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching history: {str(e)}")
+
+
+@app.get("/history/analyses", tags=["History"])
+async def get_analysis_history(
+    limit: int = 100,
+    analysis_type: Optional[str] = None
+):
+    """
+    Get analysis history from MongoDB.
+    
+    Args:
+        limit: Maximum number of records to return
+        analysis_type: Filter by type (image, video, live)
+        
+    Returns:
+        List of analysis results
+    """
+    if pipeline is None:
+        raise HTTPException(status_code=503, detail="Pipeline not initialized")
+    
+    if not hasattr(pipeline, 'mongodb_manager') or pipeline.mongodb_manager is None:
+        raise HTTPException(status_code=503, detail="MongoDB not enabled")
+    
+    try:
+        history = pipeline.mongodb_manager.get_analysis_history(
+            limit=limit,
+            analysis_type=analysis_type
+        )
+        return {
+            "total": len(history),
+            "history": history
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching history: {str(e)}")
+
+
+@app.get("/stats", tags=["System"])
+async def get_statistics():
+    """Get database statistics from MongoDB"""
+    if pipeline is None:
+        raise HTTPException(status_code=503, detail="Pipeline not initialized")
+    
+    if not hasattr(pipeline, 'mongodb_manager') or pipeline.mongodb_manager is None:
+        # Return basic stats if MongoDB not enabled
+        return {
+            "mongodb_enabled": False,
+            "total_faces": len(pipeline.face_recognizer.list_identities())
+        }
+    
+    try:
+        stats = pipeline.mongodb_manager.get_statistics()
+        stats['mongodb_enabled'] = True
+        return stats
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error fetching stats: {str(e)}")
+
+
 # ===== Run Server =====
 if __name__ == "__main__":
     import uvicorn

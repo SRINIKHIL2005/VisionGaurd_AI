@@ -31,6 +31,10 @@ uvicorn[standard]>=0.25.0     # ASGI server
 streamlit>=1.29.0             # Easy UI framework
 python-multipart>=0.0.6       # File upload support
 
+# ===== Database =====
+pymongo>=4.6.0                # MongoDB driver
+dnspython>=2.4.2              # Required for MongoDB+SRV connections
+
 # ===== Telegram Bot =====
 python-telegram-bot>=21.0     # Telegram Bot API (async)
 
