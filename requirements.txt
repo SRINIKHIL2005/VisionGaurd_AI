@@ -31,6 +31,11 @@ uvicorn[standard]>=0.25.0     # ASGI server
 streamlit>=1.29.0             # Easy UI framework
 python-multipart>=0.0.6       # File upload support
 
+# ===== Authentication & Security =====
+python-jose[cryptography]>=3.3.0  # JWT token handling
+passlib[bcrypt]>=1.7.4        # Password hashing
+python-dotenv>=1.0.0          # Environment variables (moved from utilities)
+
 # ===== Database =====
 pymongo>=4.6.0                # MongoDB driver
 dnspython>=2.4.2              # Required for MongoDB+SRV connections
@@ -51,7 +56,6 @@ scipy>=1.11.0
 
 # ===== Configuration & Logging =====
 pyyaml>=6.0.1
-python-dotenv>=1.0.0
 loguru>=0.7.2
 
 # ===== Optional: Advanced Features =====

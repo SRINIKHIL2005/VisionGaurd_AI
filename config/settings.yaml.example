@@ -30,6 +30,7 @@ models:
     agnostic_nms: false  # Class-agnostic NMS
     # Weapon detection model (optional - place custom model and update path)
     weapon_model: "./Learning/weapon_training/weapon_detector_v1/weights/best.pt"  # Custom trained weapon detector
+    weapon_confidence: 0.50  # Weapon model threshold (lower = more detections)
 
 
 # ===== Risk Assessment =====

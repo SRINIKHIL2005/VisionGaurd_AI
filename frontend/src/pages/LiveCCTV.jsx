@@ -1,7 +1,9 @@
 import { useState, useRef, useEffect } from 'react'
 import { motion } from 'framer-motion'
-import { Camera, Video, Play, Square, AlertCircle, Activity, Target, Eye } from 'lucide-react'
+import { Camera, Video, Play, Square, AlertCircle, Activity, Target, Eye, MessageCircle, Settings } from 'lucide-react'
 import Webcam from 'react-webcam'
+import authService from '../services/authService'
+import { Link } from 'react-router-dom'
 
 export default function LiveCCTV() {
   const [isMonitoring, setIsMonitoring] = useState(false)
@@ -10,6 +12,7 @@ export default function LiveCCTV() {
   const [result, setResult] = useState(null)
   const [cameraIndex, setCameraIndex] = useState(0)
   const [frameSkip, setFrameSkip] = useState(2)
+  const [isAnalyzing, setIsAnalyzing] = useState(false)
   const webcamRef = useRef(null)
   const intervalRef = useRef(null)
 
@@ -18,6 +21,12 @@ export default function LiveCCTV() {
     
     // Process frames periodically
     intervalRef.current = setInterval(async () => {
+      // Skip if already analyzing
+      if (isAnalyzing) {
+        console.log('⏭️ Skipping frame - analysis in progress')
+        return
+      }
+      
       if (webcamRef.current) {
         const imageSrc = webcamRef.current.getScreenshot()
         if (imageSrc) {
@@ -39,6 +48,7 @@ export default function LiveCCTV() {
   }
 
   const analyzeFrame = async (imageBase64) => {
+    setIsAnalyzing(true)
     try {
       // Convert base64 to blob
       const response = await fetch(imageBase64)
@@ -48,21 +58,24 @@ export default function LiveCCTV() {
       formData.append('file', blob, 'frame.jpg')
       formData.append('return_annotated', 'true')
 
-      const apiResponse = await fetch('http://localhost:8000/analyze/image', {
-        method: 'POST',
-        body: formData,
+      const axios = authService.getAuthAxios()
+      const apiResponse = await axios.post('/analyze/image', formData, {
+        headers: {
+          'Content-Type': 'multipart/form-data'
+        }
       })
 
-      if (apiResponse.ok) {
-        const data = await apiResponse.json()
-        setResult(data)
+      if (apiResponse.data) {
+        setResult(apiResponse.data)
         // Set annotated image if available
-        if (data.annotated_image) {
-          setAnnotatedFrame(`data:image/jpeg;base64,${data.annotated_image}`)
+        if (apiResponse.data.annotated_image) {
+          setAnnotatedFrame(`data:image/jpeg;base64,${apiResponse.data.annotated_image}`)
         }
       }
     } catch (err) {
       console.error('Frame analysis error:', err)
+    } finally {
+      setIsAnalyzing(false)
     }
   }
 
@@ -84,6 +97,31 @@ export default function LiveCCTV() {
           Live CCTV Monitoring
         </h1>
         <p className="text-gray-600">Real-time surveillance and threat detection</p>
+      </motion.div>
+
+      {/* Telegram Notification Reminder */}
+      <motion.div
+        initial={{ opacity: 0, y: -10 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ delay: 0.1 }}
+        className="bg-blue-50 border-l-4 border-blue-500 p-4 rounded-lg"
+      >
+        <div className="flex items-start gap-3">
+          <MessageCircle className="w-5 h-5 text-blue-600 mt-0.5 flex-shrink-0" />
+          <div className="flex-1">
+            <p className="text-sm text-blue-900">
+              <strong>💡 Tip:</strong> Enable Telegram notifications to receive instant alerts when unknown faces are detected - 
+              even when you're away from your computer!
+            </p>
+            <Link
+              to="/settings"
+              className="inline-flex items-center gap-1 text-sm text-blue-700 hover:text-blue-800 font-medium mt-2"
+            >
+              <Settings className="w-4 h-4" />
+              Configure in Settings →
+            </Link>
+          </div>
+        </div>
       </motion.div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">

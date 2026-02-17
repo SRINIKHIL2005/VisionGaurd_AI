@@ -12,6 +12,10 @@ from typing import List, Dict, Optional, Tuple
 import cv2
 import numpy as np
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+try:
+    from telegram.request import HTTPXRequest
+except Exception:  # pragma: no cover
+    HTTPXRequest = None
 from telegram.ext import (
     Application, 
     CommandHandler, 
@@ -50,6 +54,14 @@ class TelegramNotifier:
         self.app = None
         self.pending_approvals = {}  # {detection_id: {data}}
         self.conversation_state = {}  # {chat_id: {state, detection_id}}
+
+        # Rate limiting: enforce minimum time between notifications
+        self._last_notification_at: Optional[datetime] = None
+        self._send_lock = asyncio.Lock()
+        self._last_skip_reason: Optional[str] = None
+
+        # Track lifecycle
+        self._started: bool = False
         
         # Paths
         self.unknown_queue_path = Path("data/face_database/unknown_queue.json")
@@ -65,7 +77,16 @@ class TelegramNotifier:
     async def initialize(self):
         """Initialize the Telegram bot application"""
         try:
-            self.app = Application.builder().token(self.bot_token).build()
+            if self._started:
+                return
+
+            # Under heavy CPU load (live CCTV), Telegram requests can be delayed.
+            # Use more forgiving timeouts to reduce spurious "Timed out" failures.
+            if HTTPXRequest is not None:
+                request = HTTPXRequest(connect_timeout=20.0, read_timeout=30.0, write_timeout=30.0, pool_timeout=20.0)
+                self.app = Application.builder().token(self.bot_token).request(request).build()
+            else:
+                self.app = Application.builder().token(self.bot_token).build()
             
             # Add handlers
             self.app.add_handler(CommandHandler("start", self._handle_start))
@@ -84,6 +105,8 @@ class TelegramNotifier:
             
             # Send startup message
             await self.send_startup_message()
+
+            self._started = True
             
         except Exception as e:
             logger.error(f"❌ Failed to initialize Telegram bot: {e}")
@@ -98,7 +121,23 @@ class TelegramNotifier:
             
             await self.app.stop()
             await self.app.shutdown()
-            logger.info("🛑 Telegram bot stopped")
+        self._started = False
+
+
+    async def send_text_message(self, text: str, parse_mode: Optional[str] = None) -> bool:
+        """Send a plain Telegram message to the owner chat."""
+        try:
+            if not self.app:
+                raise RuntimeError("Telegram notifier not initialized")
+            await self.app.bot.send_message(
+                chat_id=self.owner_chat_id,
+                text=text,
+                parse_mode=parse_mode,
+            )
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to send text message: {e}")
+            return False
     
     async def send_startup_message(self):
         """Send a test message when bot starts"""
@@ -122,15 +161,15 @@ class TelegramNotifier:
     def _load_queue(self) -> List[Dict]:
         """Load unknown faces queue from JSON"""
         if self.unknown_queue_path.exists():
-            with open(self.unknown_queue_path, 'r') as f:
+            with open(self.unknown_queue_path, 'r', encoding='utf-8') as f:
                 return json.load(f)
         return []
     
     def _save_queue(self, queue: List[Dict]):
         """Save unknown faces queue to JSON"""
         self.unknown_queue_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.unknown_queue_path, 'w') as f:
-            json.dump(queue, f, indent=2)
+        with open(self.unknown_queue_path, 'w', encoding='utf-8') as f:
+            json.dump(queue, f, indent=2, ensure_ascii=False)
     
     def check_cooldown(self, face_embedding: np.ndarray) -> bool:
         """
@@ -224,7 +263,10 @@ class TelegramNotifier:
         self,
         image: np.ndarray,
         unknown_faces: List[Dict],  # [{"embedding": array, "bbox": (x,y,w,h)}]
-        camera_location: str = "Unknown"
+        camera_location: str = "Unknown",
+        risk_assessment: Optional[Dict] = None,
+        summary: Optional[str] = None,
+        suspicious_objects: Optional[List[str]] = None,
     ) -> Optional[str]:
         """
         Send notification about unknown face(s) detected
@@ -238,38 +280,54 @@ class TelegramNotifier:
             Detection ID if successful, None otherwise
         """
         try:
-            # Generate unique detection ID
-            detection_id = f"uf_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-            
-            # Create annotated image with rectangles
-            bounding_boxes = [face['bbox'] for face in unknown_faces]
-            unknown_indices = list(range(len(unknown_faces)))
-            annotated_image = self.create_annotated_image(image, bounding_boxes, unknown_indices)
-            
-            # Save annotated image
-            image_filename = f"{detection_id}.jpg"
-            image_path = self.unknown_images_dir / image_filename
-            cv2.imwrite(str(image_path), annotated_image)
-            
-            # Save to queue
-            detection_data = {
-                "id": detection_id,
-                "timestamp": datetime.now().isoformat(),
-                "image_path": str(image_path),
-                "embeddings": [face['embedding'].tolist() for face in unknown_faces],
-                "bounding_boxes": bounding_boxes,
-                "camera_location": camera_location,
-                "status": "notified",
-                "unknown_count": len(unknown_faces)
-            }
-            
-            queue = self._load_queue()
-            queue.append(detection_data)
-            self._save_queue(queue)
-            
-            # Prepare message
-            timestamp_str = datetime.now().strftime("%b %d, %Y - %H:%M:%S")
-            face_count = len(unknown_faces)
+            # Serialize the entire send path.
+            # Without this, multiple concurrent tasks can pass the rate-limit check
+            # before `_last_notification_at` gets updated, causing floods/timeouts.
+            async with self._send_lock:
+                if self._last_notification_at is not None:
+                    seconds_since_last = (datetime.now() - self._last_notification_at).total_seconds()
+                    if seconds_since_last < 20:
+                        self._last_skip_reason = "rate_limit"
+                        logger.info(f"⏱️ Skipping Telegram notification (rate limit: {seconds_since_last:.1f}s since last < 20s)")
+                        return None
+
+                # Generate unique detection ID
+                detection_id = f"uf_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+
+                # Create annotated image with rectangles (OpenCV work off the event loop)
+                bounding_boxes = [face['bbox'] for face in unknown_faces]
+                unknown_indices = list(range(len(unknown_faces)))
+                annotated_image = await asyncio.to_thread(
+                    self.create_annotated_image,
+                    image,
+                    bounding_boxes,
+                    unknown_indices,
+                )
+
+                # Save annotated image (disk IO off the event loop)
+                image_filename = f"{detection_id}.jpg"
+                image_path = self.unknown_images_dir / image_filename
+                await asyncio.to_thread(cv2.imwrite, str(image_path), annotated_image)
+
+                # Save to queue
+                detection_data = {
+                    "id": detection_id,
+                    "timestamp": datetime.now().isoformat(),
+                    "image_path": str(image_path),
+                    "embeddings": [face['embedding'].tolist() for face in unknown_faces],
+                    "bounding_boxes": bounding_boxes,
+                    "camera_location": camera_location,
+                    "status": "notified",
+                    "unknown_count": len(unknown_faces)
+                }
+
+                queue = self._load_queue()
+                queue.append(detection_data)
+                self._save_queue(queue)
+
+                # Prepare message
+                timestamp_str = datetime.now().strftime("%b %d, %Y - %H:%M:%S")
+                face_count = len(unknown_faces)
             
             if face_count == 1:
                 caption = (
@@ -288,6 +346,21 @@ class TelegramNotifier:
                     f"⚠️ {face_count} unknown persons in frame\n"
                     "Click Approve to add ALL faces to database."
                 )
+
+            # Add risk + summary if provided
+            if risk_assessment:
+                risk_level = risk_assessment.get("risk_level") or risk_assessment.get("level")
+                risk_score = risk_assessment.get("risk_score")
+                if risk_level is not None:
+                    caption += f"\n\n⚠️ *Risk Level:* {risk_level}"
+                if risk_score is not None:
+                    caption += f"\n📊 *Risk Score:* {risk_score}"
+
+            if summary:
+                caption += f"\n\n📝 *Summary:* {summary}"
+
+            if suspicious_objects:
+                caption += f"\n\n🚫 *Suspicious Objects:* {', '.join(suspicious_objects)}"
             
             # Create inline keyboard
             keyboard = [
@@ -307,10 +380,14 @@ class TelegramNotifier:
                     parse_mode='Markdown',
                     reply_markup=reply_markup
                 )
-            
+
+            # Record send time
+            self._last_notification_at = datetime.now()
+            self._last_skip_reason = None
+
             # Store in pending approvals
             self.pending_approvals[detection_id] = detection_data
-            
+
             logger.info(f"📤 Notification sent for detection {detection_id} ({face_count} unknown faces)")
             return detection_id
             
@@ -653,28 +730,79 @@ class TelegramNotifier:
             logger.error(f"❌ Failed to handle emergency: {e}")
 
 
-# Global notifier instance (singleton)
-_notifier_instance = None
+# Global notifier instances (per user)
+_notifier_instances: Dict[str, TelegramNotifier] = {}
+_default_notifier_user_id: Optional[str] = None
+_notifier_init_locks: Dict[str, asyncio.Lock] = {}
 
-def get_notifier(bot_token: str = None, owner_chat_id: int = None, config: dict = None, face_recognizer=None) -> Optional[TelegramNotifier]:
-    """Get or create Telegram notifier instance"""
-    global _notifier_instance
-    
-    if _notifier_instance is None and bot_token and owner_chat_id:
-        _notifier_instance = TelegramNotifier(bot_token, owner_chat_id, config or {}, face_recognizer)
-    
-    return _notifier_instance
 
-async def initialize_notifier(bot_token: str, owner_chat_id: int, config: dict = None, face_recognizer=None):
-    """Initialize and start the Telegram notifier"""
-    notifier = get_notifier(bot_token, owner_chat_id, config, face_recognizer)
+def get_notifier(
+    user_id: Optional[str] = None,
+    bot_token: str = None,
+    owner_chat_id: int = None,
+    config: dict = None,
+    face_recognizer=None,
+) -> Optional[TelegramNotifier]:
+    """Get or create a Telegram notifier instance (optionally per-user)."""
+    global _default_notifier_user_id
+
+    effective_user_id = user_id or _default_notifier_user_id
+    if effective_user_id:
+        notifier = _notifier_instances.get(effective_user_id)
+        if notifier is None and bot_token and owner_chat_id:
+            notifier = TelegramNotifier(bot_token, owner_chat_id, config or {}, face_recognizer)
+            _notifier_instances[effective_user_id] = notifier
+        return notifier
+
+    # Backward-compatible single default instance (stored under key 'default')
+    if 'default' not in _notifier_instances and bot_token and owner_chat_id:
+        _notifier_instances['default'] = TelegramNotifier(bot_token, owner_chat_id, config or {}, face_recognizer)
+        _default_notifier_user_id = 'default'
+    return _notifier_instances.get('default')
+
+
+async def initialize_notifier(
+    bot_token: str,
+    owner_chat_id: int,
+    config: dict = None,
+    face_recognizer=None,
+    user_id: Optional[str] = None,
+):
+    """Initialize and start the Telegram notifier (optionally per-user)."""
+    global _default_notifier_user_id
+
+    effective_user_id = user_id or 'default'
+    _default_notifier_user_id = effective_user_id
+
+    # Ensure only one initializer runs per user at a time
+    if effective_user_id not in _notifier_init_locks:
+        _notifier_init_locks[effective_user_id] = asyncio.Lock()
+
+    async with _notifier_init_locks[effective_user_id]:
+        notifier = get_notifier(effective_user_id, bot_token, owner_chat_id, config, face_recognizer)
+        if notifier and not notifier._started:
+            await notifier.initialize()
+        return notifier
+
+
+async def shutdown_notifier(user_id: Optional[str] = None):
+    """Shutdown a Telegram notifier (one user) or all notifiers (if user_id is None)."""
+    global _default_notifier_user_id
+
+    if user_id is None:
+        # Shutdown all
+        for uid, notifier in list(_notifier_instances.items()):
+            try:
+                await notifier.shutdown()
+            except Exception:
+                pass
+            _notifier_instances.pop(uid, None)
+        _default_notifier_user_id = None
+        return
+
+    notifier = _notifier_instances.get(user_id)
     if notifier:
-        await notifier.initialize()
-    return notifier
-
-async def shutdown_notifier():
-    """Shutdown the Telegram notifier"""
-    global _notifier_instance
-    if _notifier_instance:
-        await _notifier_instance.shutdown()
-        _notifier_instance = None
+        await notifier.shutdown()
+        _notifier_instances.pop(user_id, None)
+        if _default_notifier_user_id == user_id:
+            _default_notifier_user_id = None

@@ -52,6 +52,7 @@ data/outputs/*
 data/face_database/*.pkl
 data/face_database/unknown_images/*
 data/face_database/unknown_queue.json
+data/face_database/**
 !data/.gitkeep
 !logs/.gitkeep
 
@@ -94,3 +95,6 @@ test_*.mp4
 # Cache
 .cache/
 *.cache
+
+# Local comparison outputs
+comparison_results/

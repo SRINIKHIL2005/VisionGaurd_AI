@@ -17,13 +17,15 @@ Endpoints:
 - GET /health - Health check
 """
 
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Depends
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 from typing import Optional, List
 import sys
 import os
+import asyncio
+from datetime import datetime
 from pathlib import Path
 import cv2
 import numpy as np
@@ -38,6 +40,15 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 from pipeline.vision_pipeline import VisionPipeline
 from utils.telegram_notifier import get_notifier, initialize_notifier, shutdown_notifier
+from utils.auth import (
+    hash_password,
+    verify_password,
+    create_access_token,
+    create_refresh_token,
+    decode_token,
+    get_current_user,
+    get_current_user_optional,
+)
 
 # ===== Initialize FastAPI App =====
 app = FastAPI(
@@ -58,6 +69,14 @@ app.add_middleware(
 # ===== Global Pipeline Instance =====
 pipeline: Optional[VisionPipeline] = None
 
+# Live notification throttle (per user)
+_last_live_telegram_enqueue_at: dict = {}
+
+# Live CCTV can POST frames very fast; bound concurrent analysis so
+# background tasks (Telegram sends) don't get starved.
+_ANALYZE_CONCURRENCY = int(os.getenv("VG_ANALYZE_CONCURRENCY", "1"))
+_analyze_semaphore = asyncio.Semaphore(max(1, _ANALYZE_CONCURRENCY))
+
 
 # ===== Startup Event =====
 @app.on_event("startup")
@@ -68,36 +87,8 @@ async def startup_event():
     pipeline = VisionPipeline(config_path="config/settings.yaml")
     print("✅ API Ready!\n")
     
-    # Initialize Telegram bot if configured
-    try:
-        config_path = Path("config/settings.yaml")
-        if config_path.exists():
-            with open(config_path) as f:
-                config = yaml.safe_load(f)
-            
-            telegram_config = config.get('telegram', {})
-            if telegram_config.get('enabled', False):
-                bot_token = telegram_config.get('bot_token')
-                owner_chat_id = telegram_config.get('owner_chat_id')
-                
-                if bot_token and owner_chat_id:
-                    print("🤖 Initializing Telegram Bot...")
-                    await initialize_notifier(
-                        bot_token=bot_token,
-                        owner_chat_id=int(owner_chat_id),
-                        config={
-                            'cooldown_minutes': telegram_config.get('cooldown_minutes', 3),
-                            'retention_days': telegram_config.get('retention_days', 10)
-                        },
-                        face_recognizer=pipeline.face_recognizer  # Pass shared instance
-                    )
-                    print("✅ Telegram Bot initialized!")
-                else:
-                    print("⚠️ Telegram enabled but missing bot_token or owner_chat_id")
-            else:
-                print("ℹ️ Telegram notifications disabled in config")
-    except Exception as e:
-        print(f"⚠️ Failed to initialize Telegram bot: {e}")
+    # Telegram is initialized on-demand per user via /user/telegram-settings
+    # (avoids multiple instances and ensures user-specific credentials)
 
 
 @app.on_event("shutdown")
@@ -124,6 +115,55 @@ class HealthResponse(BaseModel):
     status: str
     version: str
     models_loaded: dict
+
+
+# ===== Authentication Models =====
+class RegisterRequest(BaseModel):
+    """User registration request"""
+    email: EmailStr
+    password: str
+    full_name: str
+
+
+class LoginRequest(BaseModel):
+    """User login request"""
+    email: EmailStr
+    password: str
+
+
+class TokenResponse(BaseModel):
+    """Authentication token response"""
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+    user: dict
+
+
+class UserResponse(BaseModel):
+    """User information response"""
+    user_id: str
+    email: str
+    full_name: str
+    created_at: str
+
+
+class RefreshRequest(BaseModel):
+    """Refresh token request"""
+    refresh_token: str
+
+
+class TelegramSettingsRequest(BaseModel):
+    """Telegram settings update request"""
+    enabled: bool = False
+    bot_token: str = ""
+    chat_id: str = ""
+    cooldown_minutes: int = 3
+    retention_days: int = 10
+
+
+class TelegramMessageRequest(BaseModel):
+    """Simple Telegram message request"""
+    message: str
 
 
 # ===== Helper Functions =====
@@ -175,12 +215,338 @@ async def root():
         "status": "running",
         "docs": "/docs",
         "endpoints": {
+            "register": "POST /auth/register",
+            "login": "POST /auth/login",
             "analyze_image": "POST /analyze/image",
             "analyze_video": "POST /analyze/video",
             "add_face": "POST /face/add",
             "list_faces": "GET /face/list",
             "health": "GET /health"
         }
+    }
+
+
+# ===== Authentication Endpoints =====
+
+@app.post("/auth/register", response_model=TokenResponse, tags=["Authentication"])
+async def register(request: RegisterRequest):
+    """
+    Register a new user account.
+    
+    Args:
+        request: Registration data (email, password, full_name)
+        
+    Returns:
+        Access token, refresh token, and user info
+    """
+    if pipeline is None or not hasattr(pipeline, 'mongodb_manager') or pipeline.mongodb_manager is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    # Check if user already exists
+    existing_user = pipeline.mongodb_manager.get_user_by_email(request.email)
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    
+    # Hash password
+    hashed_password = hash_password(request.password)
+    
+    # Create user
+    user_id = pipeline.mongodb_manager.create_user(
+        email=request.email,
+        hashed_password=hashed_password,
+        full_name=request.full_name
+    )
+    
+    if not user_id:
+        raise HTTPException(status_code=500, detail="Failed to create user")
+    
+    # Create tokens
+    access_token = create_access_token(data={
+        "sub": user_id,
+        "email": request.email,
+        "full_name": request.full_name
+    })
+    refresh_token = create_refresh_token(data={"sub": user_id})
+    
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "user": {
+            "user_id": user_id,
+            "email": request.email,
+            "full_name": request.full_name
+        }
+    }
+
+
+@app.post("/auth/login", response_model=TokenResponse, tags=["Authentication"])
+async def login(request: LoginRequest):
+    """
+    Login with email and password.
+    
+    Args:
+        request: Login credentials (email, password)
+        
+    Returns:
+        Access token, refresh token, and user info
+    """
+    if pipeline is None or not hasattr(pipeline, 'mongodb_manager') or pipeline.mongodb_manager is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    # Get user from database
+    user = pipeline.mongodb_manager.get_user_by_email(request.email)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    
+    # Verify password
+    if not verify_password(request.password, user['password']):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    
+    # Check if user is active
+    if not user.get('is_active', True):
+        raise HTTPException(status_code=401, detail="Account is disabled")
+    
+    user_id = str(user['_id'])
+    
+    # Create tokens
+    access_token = create_access_token(data={
+        "sub": user_id,
+        "email": user['email'],
+        "full_name": user['full_name']
+    })
+    refresh_token = create_refresh_token(data={"sub": user_id})
+    
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "user": {
+            "user_id": user_id,
+            "email": user['email'],
+            "full_name": user['full_name']
+        }
+    }
+
+
+@app.post("/auth/refresh", tags=["Authentication"])
+async def refresh_token(request: RefreshRequest):
+    """Refresh access token using refresh token."""
+    if pipeline is None or not hasattr(pipeline, 'mongodb_manager') or pipeline.mongodb_manager is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    payload = decode_token(request.refresh_token)
+    if payload.get("type") != "refresh":
+        raise HTTPException(status_code=401, detail="Invalid token type")
+
+    user_id = payload.get("sub")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+
+    user = pipeline.mongodb_manager.get_user_by_id(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    access_token = create_access_token(data={
+        "sub": str(user['_id']),
+        "email": user['email'],
+        "full_name": user['full_name'],
+    })
+    new_refresh_token = create_refresh_token(data={"sub": str(user['_id'])})
+
+    return {
+        "access_token": access_token,
+        "refresh_token": new_refresh_token,
+        "token_type": "bearer",
+    }
+
+
+# ===== User Settings (Telegram) =====
+
+@app.get("/user/telegram-settings", tags=["User"])
+async def get_telegram_settings(current_user: dict = Depends(get_current_user)):
+    """Get current user's Telegram settings."""
+    if pipeline is None or not hasattr(pipeline, 'mongodb_manager') or pipeline.mongodb_manager is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    user = pipeline.mongodb_manager.get_user_by_id(current_user['user_id'])
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    settings = user.get('telegram_settings') or {
+        'enabled': False,
+        'bot_token': None,
+        'chat_id': None,
+        'cooldown_minutes': 3,
+        'retention_days': 10,
+    }
+
+    # Normalize to frontend expected shapes
+    return {
+        "settings": {
+            "enabled": bool(settings.get('enabled', False)),
+            "bot_token": settings.get('bot_token') or "",
+            "chat_id": str(settings.get('chat_id') or ""),
+            "cooldown_minutes": int(settings.get('cooldown_minutes', 3)),
+            "retention_days": int(settings.get('retention_days', 10)),
+        }
+    }
+
+
+@app.put("/user/telegram-settings", tags=["User"])
+async def update_telegram_settings(
+    request: TelegramSettingsRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Update current user's Telegram settings and (de)initialize notifier."""
+    if pipeline is None or not hasattr(pipeline, 'mongodb_manager') or pipeline.mongodb_manager is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    # Validate required fields if enabling
+    if request.enabled:
+        if not request.bot_token or not request.chat_id:
+            raise HTTPException(status_code=400, detail="bot_token and chat_id are required when enabled")
+        try:
+            int(request.chat_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="chat_id must be numeric")
+
+    settings_doc = {
+        'enabled': bool(request.enabled),
+        'bot_token': request.bot_token or None,
+        'chat_id': request.chat_id or None,
+        'cooldown_minutes': int(request.cooldown_minutes or 3),
+        'retention_days': int(request.retention_days or 10),
+    }
+
+    ok = pipeline.mongodb_manager.update_telegram_settings(current_user['user_id'], settings_doc)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to update settings")
+
+    # Start or stop notifier
+    if settings_doc['enabled']:
+        await initialize_notifier(
+            bot_token=settings_doc['bot_token'],
+            owner_chat_id=int(settings_doc['chat_id']),
+            config={
+                'cooldown_minutes': settings_doc['cooldown_minutes'],
+                'retention_days': settings_doc['retention_days'],
+            },
+            face_recognizer=pipeline.face_recognizer,
+            user_id=current_user['user_id'],
+        )
+    else:
+        await shutdown_notifier(user_id=current_user['user_id'])
+
+    return {"success": True}
+
+
+@app.post("/user/test-telegram", tags=["User"])
+async def test_telegram(current_user: dict = Depends(get_current_user)):
+    """Send a test Telegram message using saved credentials."""
+    if pipeline is None or not hasattr(pipeline, 'mongodb_manager') or pipeline.mongodb_manager is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    user = pipeline.mongodb_manager.get_user_by_id(current_user['user_id'])
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    settings = user.get('telegram_settings') or {}
+    if not settings.get('enabled'):
+        raise HTTPException(status_code=400, detail="Telegram notifications are disabled")
+
+    bot_token = settings.get('bot_token')
+    chat_id = settings.get('chat_id')
+    if not bot_token or not chat_id:
+        raise HTTPException(status_code=400, detail="Missing bot_token or chat_id")
+
+    notifier = get_notifier(user_id=current_user['user_id'])
+    if notifier is None:
+        notifier = await initialize_notifier(
+            bot_token=bot_token,
+            owner_chat_id=int(chat_id),
+            config={
+                'cooldown_minutes': int(settings.get('cooldown_minutes', 3)),
+                'retention_days': int(settings.get('retention_days', 10)),
+            },
+            face_recognizer=pipeline.face_recognizer,
+            user_id=current_user['user_id'],
+        )
+
+    try:
+        await notifier.send_startup_message()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to send test message: {str(e)}")
+
+    return {"success": True, "message": "Test message sent! Check your Telegram app."}
+
+
+@app.post("/user/send-telegram", tags=["User"])
+async def send_telegram_message(
+    request: TelegramMessageRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Send a normal Telegram text message using saved credentials (debug helper)."""
+    if pipeline is None or not hasattr(pipeline, 'mongodb_manager') or pipeline.mongodb_manager is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    user = pipeline.mongodb_manager.get_user_by_id(current_user['user_id'])
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    settings = user.get('telegram_settings') or {}
+    if not settings.get('enabled'):
+        raise HTTPException(status_code=400, detail="Telegram notifications are disabled")
+
+    bot_token = settings.get('bot_token')
+    chat_id = settings.get('chat_id')
+    if not bot_token or not chat_id:
+        raise HTTPException(status_code=400, detail="Missing bot_token or chat_id")
+
+    notifier = get_notifier(user_id=current_user['user_id'])
+    if notifier is None:
+        notifier = await initialize_notifier(
+            bot_token=bot_token,
+            owner_chat_id=int(chat_id),
+            config={
+                'cooldown_minutes': int(settings.get('cooldown_minutes', 3)),
+                'retention_days': int(settings.get('retention_days', 10)),
+            },
+            face_recognizer=pipeline.face_recognizer,
+            user_id=current_user['user_id'],
+        )
+
+    ok = await notifier.send_text_message(request.message)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to send Telegram message")
+
+    return {"success": True}
+
+
+@app.get("/auth/me", response_model=UserResponse, tags=["Authentication"])
+async def get_me(current_user: dict = Depends(get_current_user)):
+    """
+    Get current authenticated user information.
+    
+    Args:
+        current_user: Current user from JWT token (injected by dependency)
+        
+    Returns:
+        User information
+    """
+    if pipeline is None or not hasattr(pipeline, 'mongodb_manager') or pipeline.mongodb_manager is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    # Get full user data from database
+    user = pipeline.mongodb_manager.get_user_by_id(current_user['user_id'])
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    return {
+        "user_id": str(user['_id']),
+        "email": user['email'],
+        "full_name": user['full_name'],
+        "created_at": user['created_at'].isoformat()
     }
 
 
@@ -214,7 +580,8 @@ async def test_config():
 @app.post("/analyze/image", response_model=AnalysisResponse, tags=["Analysis"])
 async def analyze_image(
     file: UploadFile = File(...),
-    return_annotated: bool = Form(True)  # 🎯 DEFAULT TRUE - Always return visual analysis
+    return_annotated: bool = Form(True),  # 🎯 DEFAULT TRUE - Always return visual analysis
+    current_user: Optional[dict] = Depends(get_current_user_optional),
 ):
     """
     Analyze an uploaded image.
@@ -237,6 +604,9 @@ async def analyze_image(
         # Read and decode image
         contents = await file.read()
         image = decode_image(contents)
+
+        # Auth context (used for per-user face DB + Telegram)
+        user_id = current_user.get('user_id') if current_user else None
         
         print(f"\n{'='*60}")
         print(f"🔍 IMAGE ANALYSIS REQUEST")
@@ -244,25 +614,62 @@ async def analyze_image(
         print(f"📥 Received image: {image.shape}")
         print(f"🎯 return_annotated parameter: {return_annotated} (type: {type(return_annotated)})")
         
-        # Process image
-        result = pipeline.process_image(image, return_annotated=return_annotated)
+        # Process image (CPU/GPU heavy) in a worker thread so the event loop stays responsive
+        await _analyze_semaphore.acquire()
+        try:
+            result = await asyncio.to_thread(
+                pipeline.process_image,
+                image,
+                return_annotated=return_annotated,
+                user_id=user_id,
+            )
+        finally:
+            _analyze_semaphore.release()
+
+        # If authenticated, ensure Telegram notifier is initialized from MongoDB settings
+        if user_id and hasattr(pipeline, 'mongodb_manager') and pipeline.mongodb_manager is not None:
+            try:
+                user = pipeline.mongodb_manager.get_user_by_id(user_id)
+                tg = (user or {}).get('telegram_settings') or {}
+                if tg.get('enabled') and tg.get('bot_token') and tg.get('chat_id'):
+                    notifier = get_notifier(user_id=user_id)
+                    if notifier is None:
+                        await initialize_notifier(
+                            bot_token=tg.get('bot_token'),
+                            owner_chat_id=int(tg.get('chat_id')),
+                            config={
+                                'cooldown_minutes': int(tg.get('cooldown_minutes', 3)),
+                                'retention_days': int(tg.get('retention_days', 10)),
+                            },
+                            face_recognizer=pipeline.face_recognizer,
+                            user_id=user_id,
+                        )
+            except Exception:
+                # Don't fail image analysis if Telegram setup fails
+                pass
         
-        # Handle Telegram notifications for unknown faces (async)
-        if hasattr(pipeline, '_last_unknown_faces') and pipeline._last_unknown_faces:
-            # Import notifier
-            from utils.telegram_notifier import get_notifier
-            notifier = get_notifier()
-            
-            if notifier:
-                # Send notification in background task
-                import asyncio
-                asyncio.create_task(
-                    pipeline._notify_unknown_faces(
-                        image, 
-                        pipeline._last_unknown_faces,
-                        camera_location="Live CCTV"
+        # Handle Telegram notifications from live feed (async, throttled)
+        should_notify = bool(getattr(pipeline, '_last_unknown_faces', None))
+        if should_notify:
+            key = user_id or 'default'
+            now = datetime.utcnow()
+            last = _last_live_telegram_enqueue_at.get(key)
+            if last is None or (now - last).total_seconds() >= 20:
+                _last_live_telegram_enqueue_at[key] = now
+
+                notifier = get_notifier(user_id=user_id) if user_id else get_notifier()
+                if notifier:
+                    asyncio.create_task(
+                        pipeline._notify_unknown_faces(
+                            image,
+                            pipeline._last_unknown_faces,
+                            camera_location="Live CCTV",
+                            user_id=user_id,
+                            risk_assessment=result.get('risk_assessment'),
+                            summary=result.get('summary'),
+                            suspicious_objects=result.get('suspicious_objects'),
+                        )
                     )
-                )
         
         print(f"\n📊 Pipeline returned {len(result)} keys: {list(result.keys())}")
         print(f"🔍 Has 'annotated_image' key: {'annotated_image' in result}")
@@ -270,7 +677,7 @@ async def analyze_image(
         # Encode annotated image BEFORE converting numpy types
         if 'annotated_image' in result and result['annotated_image'] is not None:
             print(f"✅ annotated_image exists! Shape: {result['annotated_image'].shape}")
-            result['annotated_image'] = encode_image(result['annotated_image'])
+            result['annotated_image'] = await asyncio.to_thread(encode_image, result['annotated_image'])
             print(f"✅ Encoded to base64: {len(result['annotated_image'])} characters")
         else:
             print(f"❌ NO annotated_image in result!")
@@ -809,10 +1216,12 @@ if __name__ == "__main__":
     print("📖 API Documentation: http://localhost:8000/docs")
     print("📊 Alternative Docs: http://localhost:8000/redoc\n")
     
+    reload_enabled = os.getenv("VG_API_RELOAD", "0") == "1"
+
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
         port=8000,
-        reload=True,
+        reload=reload_enabled,
         log_level="info"
     )

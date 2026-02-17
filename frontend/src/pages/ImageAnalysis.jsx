@@ -1,10 +1,11 @@
 import { useState, useCallback, useRef } from 'react'
 import { motion } from 'framer-motion'
-import { Upload, Camera, Loader, Image as ImageIcon, AlertCircle, Shield, Eye, Target, X } from 'lucide-react'
+import { Upload, Camera, Loader, Image as ImageIcon, AlertCircle, Shield, Eye, Target, X, MessageCircle, Settings } from 'lucide-react'
 import { useDropzone } from 'react-dropzone'
 import Webcam from 'react-webcam'
-import axios from 'axios'
 import RiskBadge from '../components/RiskBadge'
+import authService from '../services/authService'
+import { Link } from 'react-router-dom'
 
 export default function ImageAnalysis() {
   const [image, setImage] = useState(null)
@@ -61,7 +62,8 @@ export default function ImageAnalysis() {
     // Backend API default is already return_annotated=True
 
     try {
-      const response = await axios.post('http://localhost:8000/analyze/image', formData, {
+      const axios = authService.getAuthAxios()
+      const response = await axios.post('/analyze/image', formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
       })
       
@@ -93,6 +95,30 @@ export default function ImageAnalysis() {
           Image Analysis
         </h1>
         <p className="text-gray-600">Upload or capture an image for AI-powered security analysis</p>
+      </motion.div>
+
+      {/* Telegram Notification Reminder */}
+      <motion.div
+        initial={{ opacity: 0, y: -10 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ delay: 0.1 }}
+        className="bg-blue-50 border-l-4 border-blue-500 p-4 rounded-lg"
+      >
+        <div className="flex items-start gap-3">
+          <MessageCircle className="w-5 h-5 text-blue-600 mt-0.5 flex-shrink-0" />
+          <div className="flex-1">
+            <p className="text-sm text-blue-900">
+              <strong>💡 Tip:</strong> Enable Telegram notifications to receive instant alerts when unknown faces are detected in your images!
+            </p>
+            <Link
+              to="/settings"
+              className="inline-flex items-center gap-1 text-sm text-blue-700 hover:text-blue-800 font-medium mt-2"
+            >
+              <Settings className="w-4 h-4" />
+              Configure in Settings →
+            </Link>
+          </div>
+        </div>
       </motion.div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">

@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { motion } from 'framer-motion'
 import { Users, Upload, Loader, AlertCircle, UserPlus, Trash2, Camera } from 'lucide-react'
 import { useDropzone } from 'react-dropzone'
-import axios from 'axios'
+import authService from '../services/authService'
 
 export default function FaceDatabase() {
   const [identities, setIdentities] = useState([])
@@ -16,7 +16,8 @@ export default function FaceDatabase() {
   // Fetch identities
   const fetchIdentities = async () => {
     try {
-      const response = await axios.get('http://localhost:8000/face/list?detailed=true')
+      const axios = authService.getAuthAxios()
+      const response = await axios.get('/face/list?detailed=true')
       setIdentities(response.data.identities)
       setLoading(false)
     } catch (err) {
@@ -54,8 +55,14 @@ export default function FaceDatabase() {
     formData.append('file', newImage)
 
     try {
-      await axios.post('http://localhost:8000/face/add', formData, {
-        headers: { 'Content-Type': 'multipart/form-data' },
+      const token = authService.getAccessToken()
+      const axios = authService.getAuthAxios()
+      
+      await axios.post('/face/add', formData, {
+        headers: { 
+          'Content-Type': 'multipart/form-data',
+          'Authorization': `Bearer ${token}`
+        },
       })
       
       // Reset form
@@ -76,7 +83,8 @@ export default function FaceDatabase() {
     if (!confirm(`Remove ${name} from database?`)) return
 
     try {
-      await axios.delete(`http://localhost:8000/face/${encodeURIComponent(name)}`)
+      const axios = authService.getAuthAxios()
+      await axios.delete(`/face/${encodeURIComponent(name)}`)
       await fetchIdentities()
     } catch (err) {
       setError(`Failed to remove ${name}`)

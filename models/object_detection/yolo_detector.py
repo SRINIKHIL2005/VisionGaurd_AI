@@ -55,6 +55,7 @@ class YOLODetector:
         device: str = 'auto',
         suspicious_objects: Optional[List[str]] = None,
         weapon_model_path: Optional[str] = None,
+        weapon_confidence: float = 0.65,
         imgsz: int = 640,
         max_det: int = 300,
         agnostic_nms: bool = False
@@ -76,6 +77,7 @@ class YOLODetector:
             device: 'auto', 'cuda', or 'cpu'
             suspicious_objects: List of object classes to flag as suspicious
             weapon_model_path: Path to custom weapon detection model (optional)
+            weapon_confidence: Confidence threshold for weapon detection (higher = fewer false positives)
             imgsz: Input image size (640, 800, 1024)
                   Larger = more accurate but slower
             max_det: Maximum detections per image
@@ -83,6 +85,7 @@ class YOLODetector:
         """
         self.confidence = confidence
         self.iou_threshold = iou_threshold
+        self.weapon_confidence = weapon_confidence
         self.imgsz = imgsz
         self.max_det = max_det
         self.agnostic_nms = agnostic_nms
@@ -174,9 +177,8 @@ class YOLODetector:
             image = np.array(image)
             # Convert RGB to BGR
             image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-        elif len(image.shape) == 3 and image.shape[2] == 3:
-            # Assume RGB, convert to BGR
-            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        # If it's already a numpy array (most of our pipeline uses OpenCV), assume it's BGR.
+        # Do NOT swap channels here; doing so breaks YOLO accuracy on live frames.
         
         return image
     
@@ -250,7 +252,7 @@ class YOLODetector:
         if self.weapon_model is not None:
             weapon_results = self.weapon_model.predict(
                 image_bgr,
-                conf=0.70,  # HIGH threshold for weapons to reduce false positives
+                conf=self.weapon_confidence,  # Use configurable weapon threshold (default 0.65)
                 iou=self.iou_threshold,
                 imgsz=self.imgsz,
                 max_det=self.max_det,

@@ -129,10 +129,15 @@ class VisionPipeline:
         # 2. Face Recognizer
         print("\n2️⃣ Loading Face Recognizer...")
         face_config = self.config['models'].get('face_recognition', {})
+        
+        # Get user_id from config or use default
+        user_id = mongodb_config.get('default_user_id', 'default_user')
+        
         self.face_recognizer = FaceRecognizer(
             similarity_threshold=face_config.get('similarity_threshold', 0.6),
             database_path=face_config.get('database_path', './data/face_database'),
-            mongodb_manager=self.mongodb_manager
+            mongodb_manager=self.mongodb_manager,
+            user_id=user_id
         )
         
         # 3. Object Detector
@@ -140,21 +145,34 @@ class VisionPipeline:
         obj_config = self.config['models'].get('object_detection', {})
         suspicious_objects = self.config['risk_assessment'].get('suspicious_objects', [])
         weapon_model = obj_config.get('weapon_model', None)
+        # Make relative paths robust (running from api/ or elsewhere)
+        project_root = Path(__file__).parent.parent
+        if weapon_model and not os.path.isabs(weapon_model):
+            weapon_model = str((project_root / weapon_model).resolve())
+
+        model_name = obj_config.get('name', 'yolov8n.pt')
+        if model_name and isinstance(model_name, str) and model_name.endswith('.pt') and not os.path.isabs(model_name):
+            candidate = (project_root / model_name)
+            if candidate.exists():
+                model_name = str(candidate.resolve())
+        weapon_confidence = obj_config.get('weapon_confidence', 0.65)
         self.object_detector = YOLODetector(
-            model_name=obj_config.get('name', 'yolov8n.pt'),
+            model_name=model_name,
             confidence=obj_config.get('confidence', 0.35),
             iou_threshold=obj_config.get('iou_threshold', 0.50),
             imgsz=obj_config.get('imgsz', 640),
             max_det=obj_config.get('max_det', 300),
             agnostic_nms=obj_config.get('agnostic_nms', False),
             suspicious_objects=suspicious_objects,
-            weapon_model_path=weapon_model
+            weapon_model_path=weapon_model,
+            weapon_confidence=weapon_confidence
         )
     
     def process_image(
         self,
         image: Union[str, np.ndarray, Image.Image],
-        return_annotated: bool = True
+        return_annotated: bool = True,
+        user_id: Optional[str] = None
     ) -> Dict:
         """
         Process a single image through the complete pipeline.
@@ -162,6 +180,7 @@ class VisionPipeline:
         Args:
             image: Input image (path, numpy array, or PIL Image)
             return_annotated: Whether to return annotated image
+            user_id: Optional user ID for per-user face recognition
             
         Returns:
             Complete analysis results with risk assessment
@@ -189,7 +208,15 @@ class VisionPipeline:
         
         # ====== 2. FACE RECOGNITION ======
         print("   2️⃣ Face Recognition...")
-        face_result = self.face_recognizer.recognize(image)
+        # Pass user_id if provided, otherwise use the face_recognizer's default
+        if user_id:
+            # Temporarily set user_id for this recognition
+            original_user_id = self.face_recognizer.user_id
+            self.face_recognizer.user_id = user_id
+            face_result = self.face_recognizer.recognize(image)
+            self.face_recognizer.user_id = original_user_id
+        else:
+            face_result = self.face_recognizer.recognize(image)
         
         # Store unknown faces for later notification (will be handled by caller)
         self._last_unknown_faces = face_result.get('unknown_faces', [])
@@ -571,7 +598,16 @@ class VisionPipeline:
         print(f"\n✅ Processed {len(results)} frames")
         return results
     
-    async def _notify_unknown_faces(self, image: np.ndarray, unknown_faces: List[Dict], camera_location: str = "Unknown"):
+    async def _notify_unknown_faces(
+        self,
+        image: np.ndarray,
+        unknown_faces: List[Dict],
+        camera_location: str = "Unknown",
+        user_id: Optional[str] = None,
+        risk_assessment: Optional[Dict] = None,
+        summary: Optional[str] = None,
+        suspicious_objects: Optional[List[str]] = None,
+    ):
         """
         Send Telegram notification for unknown faces with cooldown check.
         
@@ -579,11 +615,12 @@ class VisionPipeline:
             image: Original image with unknown faces
             unknown_faces: List of unknown face data (embeddings, bboxes)
             camera_location: Location identifier
+            suspicious_objects: Optional list of detected suspicious object labels
         """
         try:
             from utils.telegram_notifier import get_notifier
             
-            notifier = get_notifier()
+            notifier = get_notifier(user_id=user_id)
             if notifier is None:
                 print("   ⚠️ Telegram notifier not initialized, skipping notification")
                 return
@@ -606,7 +643,10 @@ class VisionPipeline:
             detection_id = await notifier.send_unknown_face_notification(
                 image=image,
                 unknown_faces=faces_to_notify,  # Only notify new faces
-                camera_location=camera_location
+                camera_location=camera_location,
+                risk_assessment=risk_assessment,
+                summary=summary,
+                suspicious_objects=suspicious_objects,
             )
             
             if detection_id:

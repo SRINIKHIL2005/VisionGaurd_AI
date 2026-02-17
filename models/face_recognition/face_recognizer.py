@@ -57,7 +57,8 @@ class FaceRecognizer:
         database_path: str = './data/face_database',
         similarity_threshold: float = 0.5,
         device: str = 'auto',
-        mongodb_manager=None
+        mongodb_manager=None,
+        user_id: str = 'default_user'
     ):
         """
         Initialize face recognizer with ArcFace model.
@@ -68,12 +69,14 @@ class FaceRecognizer:
             similarity_threshold: Minimum similarity score for match (0-1)
             device: 'auto', 'cuda', or 'cpu'
             mongodb_manager: Optional MongoDBManager instance for database storage
+            user_id: User ID for MongoDB operations (default: 'default_user')
         """
         self.database_path = database_path
         self.similarity_threshold = similarity_threshold
         self.face_database = {}
         self.mongodb_manager = mongodb_manager
         self.use_mongodb = mongodb_manager is not None
+        self.user_id = user_id
         
         # Determine device
         if device == 'auto':
@@ -120,9 +123,9 @@ class FaceRecognizer:
     def _load_database(self):
         """Load face embeddings database from MongoDB or disk"""
         if self.use_mongodb:
-            # Load from MongoDB
-            self.face_database = self.mongodb_manager.get_all_faces()
-            print(f"📂 Loaded {len(self.face_database)} identities from MongoDB")
+            # Load from MongoDB WITH user_id
+            self.face_database = self.mongodb_manager.get_all_faces(self.user_id)
+            print(f"📂 Loaded {len(self.face_database)} identities from MongoDB (user: {self.user_id})")
         else:
             # Load from pickle file
             os.makedirs(self.database_path, exist_ok=True)
@@ -266,14 +269,14 @@ class FaceRecognizer:
         
         if self.use_mongodb:
             # Save to MongoDB
-            success = self.mongodb_manager.add_face(name, embedding, metadata)
+            success = self.mongodb_manager.add_face(self.user_id, name, embedding, metadata)
             if success:
                 # Update local cache
                 self.face_database[name] = {
                     'embedding': embedding,
                     'metadata': metadata
                 }
-                print(f"✅ Added {name} to MongoDB")
+                print(f"✅ Added {name} to MongoDB (user: {self.user_id})")
             return success
         else:
             # Save to pickle file
@@ -285,18 +288,22 @@ class FaceRecognizer:
             print(f"✅ Added {name} to database with metadata")
             return True
     
-    def add_identity(self, image: Union[np.ndarray, Image.Image], name: str) -> bool:
+    def add_identity(self, image: Union[np.ndarray, Image.Image], name: str, user_id: Optional[str] = None) -> bool:
         """
         Add a new identity to the face database.
         
         Args:
             image: Face image
             name: Person's name/identifier
+            user_id: Optional user ID to override the instance's user_id
             
         Returns:
             Success status
         """
-        print(f"🔍 Attempting to add identity: {name}")
+        # Use provided user_id or fall back to instance user_id
+        effective_user_id = user_id if user_id is not None else self.user_id
+        
+        print(f"🔍 Attempting to add identity: {name} (user: {effective_user_id})")
         
         # Check if InsightFace is available
         if self.app is None:
@@ -324,19 +331,28 @@ class FaceRecognizer:
         
         # Store embedding with metadata (for manual additions via UI)
         from datetime import datetime
-        self.face_database[name] = {
-            'embedding': face['embedding'],
-            'metadata': {
-                'added_date': datetime.now().isoformat(),
-                'photo_path': None,  # Could save uploaded image here
-                'approved_by': 'Manual Upload',
-                'camera_location': 'N/A'
-            }
-        }
-        self._save_database()
         
-        print(f"✅ Successfully added {name} to database")
-        return True
+        # Temporarily store the old user_id
+        old_user_id = self.user_id
+        
+        # Set the user_id to the effective one for this operation
+        self.user_id = effective_user_id
+        
+        # Use add_face method to handle both MongoDB and pickle
+        metadata = {
+            'added_date': datetime.now().isoformat(),
+            'photo_path': None,  # Could save uploaded image here
+            'approved_by': 'Manual Upload',
+            'camera_location': 'N/A'
+        }
+        success = self.add_face(name, face['embedding'], metadata)
+        
+        # Restore original user_id
+        self.user_id = old_user_id
+        
+        if success:
+            print(f"✅ Successfully added {name} to database (user: {effective_user_id})")
+        return success
     
     def find_match(self, embedding: np.ndarray) -> Tuple[str, float]:
         """
@@ -384,6 +400,13 @@ class FaceRecognizer:
         Returns:
             Dictionary with recognition results
         """
+        # CRITICAL: Reload database from MongoDB before EVERY recognition 
+        # This ensures deletions/additions are immediately reflected
+        if self.use_mongodb and self.mongodb_manager:
+            print(f"🔄 Reloading face database from MongoDB for user: {self.user_id}...")
+            self.face_database = self.mongodb_manager.get_all_faces(self.user_id)
+            print(f"📂 Loaded {len(self.face_database)} identities for user {self.user_id}")
+        
         faces = self.detect_faces(image)
         
         if len(faces) == 0:
@@ -443,38 +466,55 @@ class FaceRecognizer:
             'unknown_faces': unknown_faces  # List of unknown face data
         }
     
-    def remove_identity(self, name: str) -> bool:
-        """Remove an identity from the database"""
+    def remove_identity(self, name: str, user_id: Optional[str] = None) -> bool:
+        """
+        Remove an identity from the database.
+        
+        Args:
+            name: Identity name to remove
+            user_id: Optional user ID to override the instance's user_id
+            
+        Returns:
+            Success status
+        """
+        # Use provided user_id or fall back to instance user_id
+        effective_user_id = user_id if user_id is not None else self.user_id
+        
         if name in self.face_database:
             if self.use_mongodb:
                 # Remove from MongoDB
-                success = self.mongodb_manager.remove_face(name)
+                success = self.mongodb_manager.remove_face(effective_user_id, name)
                 if success:
                     # Update local cache
                     del self.face_database[name]
-                    print(f"✅ Removed {name} from MongoDB")
+                    print(f"✅ Removed {name} from MongoDB (user: {effective_user_id})")
                 return success
             else:
                 # Remove from pickle file
                 del self.face_database[name]
                 self._save_database()
-                print(f"✅ Removed {name} from database")
+                print(f"✅ Removed {name} from database (user: {effective_user_id})")
                 return True
         return False
     
-    def list_identities(self, detailed: bool = False) -> Union[List[str], List[Dict]]:
+    def list_identities(self, detailed: bool = False, user_id: Optional[str] = None) -> Union[List[str], List[Dict]]:
         """
-        Get list of all identities in database.
+        Get list of all identities in database for a specific user.
         
         Args:
             detailed: If True, return full metadata for each identity
+            user_id: Optional user ID to override the instance's user_id
             
         Returns:
             List of names or list of dicts with full info
         """
+        # Use provided user_id or fall back to instance user_id
+        effective_user_id = user_id if user_id is not None else self.user_id
+        
+        # Load identities for the specific user
         if self.use_mongodb:
-            # Query directly from MongoDB for fresh data
-            return self.mongodb_manager.list_identities(detailed=detailed)
+            # Query directly from MongoDB for fresh data with correct user_id
+            return self.mongodb_manager.list_identities(effective_user_id, detailed=detailed)
         
         # Use local pickle database
         if not detailed:
