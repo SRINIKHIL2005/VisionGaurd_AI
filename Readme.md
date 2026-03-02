@@ -1,336 +1,172 @@
-﻿# VisionGuard AI
+<div align="center">
 
-A real-time AI surveillance system that watches your cameras, detects threats, recognises faces, and alerts you instantly — all controlled by a voice assistant.
+# VisionGuard AI
 
----
+**Real-time AI surveillance that watches, detects, and alerts — so you never miss what matters.**
+
+
+
+# Overview
+
+VisionGuard AI is an intelligent security platform built for organisations that need more than passive camera feeds. It continuously analyses video in real time, identifies threats the moment they appear, and notifies the right people instantly — all through a clean, voice-controlled interface.
+
+The system is built around three independent AI engines that run simultaneously on every frame, producing a unified risk score that drives automatic alerts and a searchable history you can query in plain English.
+
 
 ## What It Does
 
-VisionGuard AI analyses every frame from a live camera, uploaded image, or video file and runs three AI models simultaneously:
-
-1. **Deepfake / AI-image detection** — flags AI-generated or manipulated media
-2. **Face recognition** — identifies registered people, queues unknowns for review
-3. **Object & weapon detection** — spots weapons, suspicious objects, and more
-
-Every detection is stored in MongoDB, a risk score is generated (Low to Critical), and a Telegram alert is sent when something serious is found. A built-in voice assistant (Jarvis) lets you ask questions about past activity and control the UI hands-free.
-
----
-
-## Architecture
-
-```
-+---------------------------------+      +----------------------------------+
-|        React Frontend           |<---->|        FastAPI Backend            |
-|  (Vite . Tailwind . Framer      |      |  api/main.py  (port 8000)        |
-|   Motion . Lucide Icons)        |      |                                  |
-|                                 |      |  +----------------------------+  |
-|  Pages                          |      |  |      VisionPipeline         |  |
-|  +-- Dashboard                  |      |  |  pipeline/vision_pipeline.py|  |
-|  +-- Image Analysis             |      |  |                            |  |
-|  +-- Video Analysis             |      |  |  +--------------------+   |  |
-|  +-- Live CCTV                  |      |  |  |  Deepfake Detector |   |  |
-|  +-- Face Database              |      |  |  |  (Gemini API / ViT)|   |  |
-|  +-- Settings                   |      |  |  +--------------------+   |  |
-|  +-- Login / Signup             |      |  |  |  Face Recognizer   |   |  |
-|                                 |      |  |  |  (InsightFace)     |   |  |
-|  Components                     |      |  |  +--------------------+   |  |
-|  +-- Jarvis Assistant           |      |  |  |  Object Detector   |   |  |
-|  +-- Wake Word Listener         |      |  |  |  (YOLOv8 + weapon) |   |  |
-|  +-- Jarvis Orb (floating mic)  |      |  |  +--------------------+   |  |
-+---------------------------------+      |  +----------------------------+  |
-                                         |                                  |
-                                         |  +----------+  +-------------+  |
-                                         |  | RAG Engine|  |Gemini Client|  |
-                                         |  |  (FAISS)  |  | 2.0 Flash   |  |
-                                         |  +----------+  +-------------+  |
-                                         |                                  |
-                                         |  +----------+  +-------------+  |
-                                         |  | MongoDB   |  |  Telegram   |  |
-                                         |  |  Atlas    |  |   Notifier  |  |
-                                         |  +----------+  +-------------+  |
-                                         +----------------------------------+
-```
+| Capability                         | Description                                                                                           |
+|------------------------------------|-------------------------------------------------------------------------------------------------------|
+| **Deepfake & Media Verification**  | Detects AI-generated or manipulated images and video frames before they cause harm                    |
+| **Face Recognition**               | Matches known individuals from a managed identity database; flags and queues unknown faces for review |
+| **Weapon & Object Detection**      | Identifies weapons, suspicious objects, and people of interest in real time                           |
+| **Instant Alerts**                 | Fires a Telegram notification with a snapshot within seconds of a high-risk detection                 |
+| **Jarvis Voice Assistant**n        | Lets operators ask questions ("what happened in the last hour?") and control the interface by voice   |
+| **Detection History & Search**     | Every event is stored and searchable — Jarvis retrieves answers from actual past logs, not guesses    |
 
 ---
 
-## How a Frame Is Processed
+## How It Works
 
 ```
-Camera / Upload / Video
+Live Camera / Uploaded Image / Video File
+                  |
+                  v
+         AI Analysis Pipeline
+         (three engines in parallel)
+         /          |           \
+   Deepfake    Face Match    Object Scan
+   Detection                + Weapon Check
+         \          |           /
+          v         v          v
+            Risk Score Engine
+          (Low / Medium / High / Critical)
+                  |
+        +---------+---------+
+        v                   v
+   MongoDB               Telegram
+   (log + history)       (instant alert)
         |
         v
-  VisionPipeline.analyze()
-        |
-        +---> Deepfake Detector
-        |         Images  --> Gemini 2.0 Flash (multipart vision)
-        |         Video   --> HuggingFace ViT (dima806/deepfake_vs_real_image_detection)
-        |
-        +---> Face Recognizer (InsightFace ArcFace r100)
-        |         Known person  --> label + confidence
-        |         Unknown face  --> saved to queue, Telegram notified
-        |
-        +---> Object Detector (YOLOv8n)
-                  General objects detected every frame
-                  Weapon sub-model (custom best.pt) runs on person crops
-                  every 3rd frame (ROI mode, only when person present)
-                        |
-                        v
-              Risk Score: Low / Medium / High / Critical
-                        |
-            +-----------+-----------+
-            v           v           v
-       MongoDB      Telegram    RAG Index
-       (log)        (alert)     (FAISS)
-                                    |
-                                    v
-                             Jarvis can answer
-                          "what happened yesterday?"
+   Jarvis RAG
+   (ask questions in plain English)
 ```
 
 ---
 
-## Models Used
+## Interface
 
-| Model | Purpose | Source |
-|---|---|---|
-| `yolov8n.pt` | General object detection (people, vehicles, bags...) | Ultralytics YOLOv8 Nano |
-| `Learning/best.pt` | Custom weapon detector (guns, knives) | Locally trained YOLO |
-| `dima806/deepfake_vs_real_image_detection` | AI-generated image detection for video frames | HuggingFace |
-| Google Gemini 2.0 Flash | Deepfake analysis for still images + AI assistant | Google API |
-| InsightFace ArcFace r100 | Face recognition and embedding | InsightFace |
+The web application is fully dark-themed and responsive, with six main sections:
+
+- **Dashboard** — live model status, system health, and project overview
+- **Image Analysis** — upload any image for a full threat report
+- **Video Analysis** — upload a video, get a frame-by-frame risk timeline
+- **Live CCTV** — real-time webcam feed with AI overlays and instant alerts
+- **Face Database** — register, view, and manage known identities
+- **Settings** — configure assistant voice, Telegram, and alert preferences
+
+A floating voice assistant (Jarvis) is available on every page. Wake it with "Hey Jarvis" and speak naturally.
 
 ---
 
-## Tech Stack
+## Tech at a Glance
 
-### Backend
+**Backend** — Python, FastAPI, PyTorch, computer vision libraries, cloud AI APIs, MongoDB Atlas, Telegram Bot API
 
-| Tool | Role |
-|---|---|
-| **FastAPI** | REST API server (async, port 8000) |
-| **Python 3.10+** | Core language |
-| **Ultralytics YOLOv8** | Object and weapon detection |
-| **InsightFace** | Face recognition (ArcFace embeddings) |
-| **HuggingFace Transformers** | ViT deepfake model for video frames |
-| **Google Gemini 2.0 Flash** | Image deepfake analysis + AI assistant LLM |
-| **FAISS** | Vector store for RAG log retrieval |
-| **MongoDB Atlas** | Cloud database for users, detections, and history |
-| **python-telegram-bot** | Telegram alerts and unknown face approve/reject |
-| **Edge TTS** | Microsoft neural TTS for Jarvis voice (free, online) |
-| **pyttsx3** | Offline TTS fallback |
-| **JWT + bcrypt** | Authentication — token issuance and password hashing |
+**Frontend** — React 18, Vite, Tailwind CSS, Framer Motion
 
-### Frontend
+**AI** — Large vision models for deepfake detection, state-of-the-art face embedding for recognition, real-time object detection with a custom-trained weapon model, and an LLM-powered assistant with retrieval-augmented generation
 
-| Tool | Role |
-|---|---|
-| **React 18** | UI framework |
-| **Vite** | Build tool and dev server (port 3000) |
-| **Tailwind CSS** | Styling |
-| **Framer Motion** | Animations and transitions |
-| **Lucide React** | Icons |
-| **Axios** | HTTP client |
-| **React Router v6** | Page routing |
+---
+
+## Getting Started
+
+### Prerequisites
+
+- Python 3.10+
+- Node.js 18+
+- MongoDB Atlas account (free tier works)
+- API keys for the AI services used (details in `config/settings.yaml.example`)
+- A webcam (for Live CCTV mode)
+- Telegram bot token (optional — only needed for alerts)
+
+### Installation
+
+```bash
+# 1. Clone the repository
+git clone https://github.com/SRINIKHIL2005/VisionGaurd_AI.git
+cd VisionGaurd_AI
+
+# 2. Set up Python environment
+python -m venv .venv
+.venv\Scripts\activate        # Windows
+# source .venv/bin/activate   # macOS / Linux
+pip install -r requirements.txt
+
+# 3. Configure the application
+copy config\settings.yaml.example config\settings.yaml
+# Open settings.yaml and fill in your API keys and connection strings
+
+# 4. Start the backend
+python api/main.py
+# Runs at http://localhost:8000
+
+# 5. Start the frontend (new terminal)
+cd frontend
+npm install
+npm run dev
+# Runs at http://localhost:3000
+```
+
+Open `http://localhost:3000`, create an account, and the system is ready.
+
+---
+
+## Configuration
+
+Copy `config/settings.yaml.example` to `config/settings.yaml` and fill in:
+
+- AI service API keys
+- MongoDB connection string
+- Telegram bot credentials (optional)
+- Detection confidence thresholds (optional — defaults are tuned)
+
+The example file documents every available option with inline comments.
 
 ---
 
 ## Project Structure
 
 ```
-VRSU/
-|-- api/
-|   `-- main.py                  # FastAPI app -- all endpoints
-|-- pipeline/
-|   `-- vision_pipeline.py       # Orchestrates all three AI models
-|-- models/
-|   |-- deepfake/
-|   |   `-- deepfake_detector.py
-|   |-- face_recognition/
-|   |   `-- face_recognizer.py
-|   `-- object_detection/
-|       `-- yolo_detector.py
-|-- utils/
-|   |-- auth.py                  # JWT helpers
-|   |-- mongodb_manager.py       # MongoDB CRUD and user management
-|   |-- rag_engine.py            # FAISS-based log retrieval
-|   |-- llm_client.py            # Gemini API wrapper (text + multipart vision)
-|   |-- telegram_notifier.py     # Telegram bot alerts
-|   `-- iou_tracker.py           # Lightweight tracker for CCTV person IDs
-|-- frontend/
-|   `-- src/
-|       |-- pages/               # Dashboard, ImageAnalysis, VideoAnalysis,
-|       |                        # LiveCCTV, FaceDatabase, Settings, Login, Signup
-|       |-- components/          # JarvisAssistant, WakeWordListener, JarvisOrb,
-|       |                        # Sidebar, ProtectedRoute, RiskBadge, StatsCard
-|       `-- services/
-|           `-- authService.js
-|-- config/
-|   |-- settings.yaml            # Your local config (git-ignored)
-|   `-- settings.yaml.example    # Template to copy from
-|-- data/
-|   `-- face_database/           # Per-user face embeddings and photos
-|-- Learning/
-|   `-- best.pt                  # Custom trained weapon detector
-|-- yolov8n.pt                   # YOLOv8 Nano base model
+VisionGaurd_AI/
+|-- api/              # FastAPI backend and all endpoints
+|-- pipeline/         # Core AI orchestration layer
+|-- models/           # Deepfake, face, and object detection modules
+|-- utils/            # Database, auth, RAG, TTS, and notification helpers
+|-- frontend/         # React web application
+|-- config/           # Settings template
+|-- data/             # Face database storage (created at runtime)
+|-- Learning/         # Custom trained model weights
 `-- requirements.txt
 ```
 
 ---
 
-## API Endpoints
+## Security & Privacy
 
-| Method | Path | Description |
-|---|---|---|
-| POST | `/auth/register` | Create account |
-| POST | `/auth/login` | Get JWT token |
-| GET | `/auth/me` | Current user info |
-| POST | `/analyze/image` | Analyse an uploaded image |
-| POST | `/analyze/video` | Analyse a video file |
-| POST | `/face/add` | Register a new face identity |
-| GET | `/face/list` | List all registered identities |
-| DELETE | `/face/{name}` | Remove an identity |
-| POST | `/assistant/narrate` | Ask Jarvis a question (RAG + Gemini) |
-| POST | `/assistant/tts` | Convert text to speech (Edge TTS) |
-| GET | `/faces/unknown` | List unknown faces pending review |
-| POST | `/faces/unknown/{id}/approve` | Approve and name an unknown face |
-| POST | `/faces/unknown/{id}/reject` | Reject an unknown face |
-| GET | `/history/detections` | Past detection logs from MongoDB |
-| GET | `/stats` | MongoDB database statistics |
-| GET | `/health` | Model load status |
-| GET | `/db/status` | MongoDB connection status |
+- All user accounts are password-protected with hashed credentials and JWT session tokens
+- Face databases are isolated per user account — no cross-user data access
+- `config/settings.yaml` (containing API keys) is excluded from version control
+- Unknown faces are never stored permanently without an operator approval step
 
 ---
 
-## Setup
+## Built With
 
-### 1. Clone and install Python dependencies
-
-```bash
-git clone <your-repo-url>
-cd VRSU
-python -m venv .venv
-
-# Windows
-.venv\Scripts\activate
-# macOS / Linux
-source .venv/bin/activate
-
-pip install -r requirements.txt
-```
-
-### 2. Configure settings
-
-```bash
-# Windows
-copy config\settings.yaml.example config\settings.yaml
-
-# macOS / Linux
-cp config/settings.yaml.example config/settings.yaml
-```
-
-Open `config/settings.yaml` and fill in:
-- `gemini_api_key` from [Google AI Studio](https://aistudio.google.com/) (free)
-- MongoDB Atlas connection string
-- Telegram bot token and chat ID (optional — only needed for alerts)
-
-### 3. Start the backend
-
-```bash
-python api/main.py
-```
-
-API available at `http://localhost:8000`  
-Interactive docs at `http://localhost:8000/docs`
-
-### 4. Start the frontend
-
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-App available at `http://localhost:3000`
+This project was built as part of an academic security research initiative, combining multiple production-grade AI systems into a unified, usable platform. The goal was to explore how modern deep learning tools can be composed into a practical, real-world surveillance product.
 
 ---
 
-## Key Features
-
-### Jarvis — AI Voice Assistant
-
-- Say **"Hey Jarvis"** to activate hands-free
-- Ask questions: *"What was detected in the last hour?"* — Jarvis retrieves actual logs via RAG and generates a grounded answer using Gemini
-- Voice navigation: *"Go to live camera"*, *"Open face database"*
-- Camera control: *"Start live feed"*, *"Stop camera"*
-- Male and female voice options (Microsoft Edge TTS neural voices)
-- Jarvis sees the current camera frame — Gemini receives the actual image as part of the prompt
-
-### Face Recognition
-
-- Registers faces with name, photo, and location metadata
-- Unknown faces are queued and saved; a Telegram message is sent with the crop for approve/reject
-- Per-user face databases — each account has its own isolated set
-
-### Weapon Detection
-
-- Custom YOLO model (`best.pt`) trained specifically on weapons
-- Runs in ROI mode — only analyses person bounding box crops, not the full frame
-- Runs every 3rd frame to reduce compute load
-- Skipped entirely if no person is detected in the frame
-
-### RAG-Powered Memory
-
-- Every detection is logged to MongoDB and indexed in FAISS
-- Jarvis retrieves the most relevant logs for each question using semantic search
-- Answers are grounded in real past events, not hallucinated
-
----
-
-## Configuration Reference
-
-Key settings in `config/settings.yaml`:
-
-```yaml
-models:
-  deepfake:
-    gemini_api_key: "your-key"
-    use_gemini_for_images: true    # Gemini for still images, ViT for video
-    threshold: 0.35
-
-  face_recognition:
-    similarity_threshold: 0.5     # Lower = stricter matching
-
-  object_detection:
-    name: "yolov8n.pt"
-    confidence: 0.35
-    weapon_model: "./Learning/best.pt"
-    weapon_confidence: 0.50
-    weapon_inference:
-      mode: "roi"                  # roi or full
-      every_n_frames: 3
-      require_person: true
-
-assistant:
-  gemini_api_key: "your-key"
-  gemini_model: "gemini-2.0-flash"
-  voice_preference: "male"        # male or female
-
-mongodb:
-  connection_string: "mongodb+srv://..."
-  database_name: "visionguard_ai"
-
-telegram:
-  bot_token: "your-bot-token"
-  chat_id: "your-chat-id"
-```
-
----
-
-## Requirements
-
-- Python 3.10+
-- Node.js 18+
-- MongoDB Atlas free tier (or local MongoDB)
-- Google Gemini API key (free tier at [aistudio.google.com](https://aistudio.google.com/))
-- Webcam (for Live CCTV mode)
-- Telegram bot (optional — for instant alerts)
+<div align="center">
+  <sub>VisionGuard AI &copy; 2026</sub>
+</div>
