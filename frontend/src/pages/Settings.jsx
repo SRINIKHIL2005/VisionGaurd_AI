@@ -12,8 +12,16 @@ function Settings() {
     cooldown_minutes: 3,
     retention_days: 10
   });
+  const [assistantSettings, setAssistantSettings] = useState({
+    enabled: false,
+    name: 'Jarvis',
+    voice: 'male',
+    web_control_enabled: false
+  });
   const [loading, setLoading] = useState(false);
   const [saveStatus, setSaveStatus] = useState(null);
+  const [assistantLoading, setAssistantLoading] = useState(false);
+  const [assistantSaveStatus, setAssistantSaveStatus] = useState(null);
   const [showTutorial, setShowTutorial] = useState(false);
   const [showBotToken, setShowBotToken] = useState(false);
   const [showChatId, setShowChatId] = useState(false);
@@ -40,9 +48,99 @@ function Settings() {
         console.error('Failed to fetch settings:', error);
       }
     };
+
+    const fetchAssistantSettings = async () => {
+      try {
+        const axios = authService.getAuthAxios();
+        const response = await axios.get('/user/assistant-settings');
+        if (response.data.settings) {
+          setAssistantSettings({
+            enabled: !!response.data.settings.enabled,
+            name: response.data.settings.name || 'Jarvis',
+            voice: response.data.settings.voice || 'male',
+            web_control_enabled: !!response.data.settings.web_control_enabled
+          });
+        }
+      } catch (error) {
+        console.error('Failed to fetch assistant settings:', error);
+      }
+    };
     
     fetchSettings();
+    fetchAssistantSettings();
   }, []);
+
+  const handleAssistantChange = (e) => {
+    const { name, value, type, checked } = e.target;
+
+    setAssistantSaveStatus(null);
+
+    const updated = {
+      ...assistantSettings,
+      [name]: type === 'checkbox' ? checked : value
+    };
+
+    setAssistantSettings(updated);
+
+    // Auto-save on toggle changes to match Telegram UX
+    if (name === 'enabled' || name === 'voice' || name === 'web_control_enabled') {
+      saveAssistantSettingsToBackend(updated);
+    }
+  };
+
+  const saveAssistantSettingsToBackend = async (settings) => {
+    setAssistantLoading(true);
+    setAssistantSaveStatus(null);
+
+    try {
+      const axios = authService.getAuthAxios();
+      const payload = {
+        enabled: !!settings.enabled,
+        name: 'Jarvis',
+        voice: settings.voice || 'male',
+        web_control_enabled: !!settings.web_control_enabled
+      };
+      await axios.put('/user/assistant-settings', payload);
+
+      setAssistantSettings(payload);
+      try {
+        window.dispatchEvent(new CustomEvent('visionguard:assistant-settings', { detail: payload }));
+      } catch {
+        // ignore
+      }
+      setAssistantSaveStatus({
+        type: 'success',
+        message: payload.enabled
+          ? `AI Assistant enabled as “${payload.name}”`
+          : 'AI Assistant disabled'
+      });
+    } catch (error) {
+      setAssistantSaveStatus({
+        type: 'error',
+        message: error.response?.data?.detail || 'Failed to save assistant settings'
+      });
+      // Revert toggle on failure
+      if (settings.enabled) {
+        setAssistantSettings({
+          ...settings,
+          enabled: false
+        });
+      }
+    }
+
+    setAssistantLoading(false);
+  };
+
+  const handleAssistantSave = async () => {
+    const payload = {
+      enabled: !!assistantSettings.enabled,
+      name: 'Jarvis',
+      voice: assistantSettings.voice || 'male',
+      web_control_enabled: !!assistantSettings.web_control_enabled
+    };
+
+    await saveAssistantSettingsToBackend(payload);
+  };
 
   const handleChange = (e) => {
     const { name, value, type, checked } = e.target;
@@ -531,6 +629,166 @@ function Settings() {
                 )}
               </button>
             </div>
+          </div>
+        </motion.div>
+
+        {/* AI Assistant Settings Card */}
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.25 }}
+          className="bg-white rounded-2xl shadow-lg p-6"
+        >
+          <div className="flex items-center gap-3 mb-2">
+            <div className="p-2 bg-purple-100 rounded-lg">
+              <SettingsIcon className="w-6 h-6 text-purple-600" />
+            </div>
+            <div>
+              <h2 className="text-xl font-semibold text-gray-900">AI Assistant</h2>
+              <p className="text-sm text-gray-600">Enable and name your surveillance assistant</p>
+            </div>
+          </div>
+
+          {/* Assistant Save Status */}
+          {assistantSaveStatus && (
+            <motion.div
+              initial={{ opacity: 0, y: -10 }}
+              animate={{ opacity: 1, y: 0 }}
+              className={`mt-4 mb-4 px-4 py-3 rounded-lg flex items-center gap-2 ${
+                assistantSaveStatus.type === 'success'
+                  ? 'bg-green-50 border border-green-200 text-green-700'
+                  : 'bg-red-50 border border-red-200 text-red-700'
+              }`}
+            >
+              {assistantSaveStatus.type === 'success' ? (
+                <CheckCircle className="w-5 h-5 flex-shrink-0" />
+              ) : (
+                <AlertCircle className="w-5 h-5 flex-shrink-0" />
+              )}
+              <span className="text-sm">{assistantSaveStatus.message}</span>
+            </motion.div>
+          )}
+
+          <div className="space-y-6">
+            {/* Enable Toggle */}
+            <div className="flex items-center justify-between p-4 bg-gray-50 rounded-lg">
+              <div>
+                <h3 className="font-medium text-gray-900 flex items-center gap-2">
+                  Enable AI Assistant
+                  {assistantSettings.enabled && (
+                    <span className="px-2 py-0.5 bg-green-100 text-green-700 text-xs font-semibold rounded-full">
+                      ACTIVE
+                    </span>
+                  )}
+                </h3>
+                <p className="text-sm text-gray-600 mt-1">
+                  {assistantSettings.enabled
+                    ? '✅ Active! Jarvis features can speak and narrate alerts'
+                    : 'Turn this ON to enable Jarvis-style narration'
+                  }
+                </p>
+              </div>
+              <label className="relative inline-flex items-center cursor-pointer">
+                <input
+                  type="checkbox"
+                  name="enabled"
+                  checked={assistantSettings.enabled}
+                  onChange={handleAssistantChange}
+                  className="sr-only peer"
+                />
+                <div className="relative w-14 h-8 bg-gray-300 peer-focus:ring-4 peer-focus:ring-purple-300 rounded-full peer peer-checked:after:translate-x-full rtl:peer-checked:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[4px] after:start-[4px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-6 after:w-6 after:transition-all peer-checked:bg-purple-600"></div>
+              </label>
+            </div>
+
+            <p className="text-sm text-gray-700">
+              Wake phrase: <span className="font-semibold">Hey Jarvis</span>
+            </p>
+
+            {/* Web Control Toggle */}
+            <div className="flex items-center justify-between p-4 bg-gray-50 rounded-lg border border-purple-100">
+              <div>
+                <h3 className="font-medium text-gray-900 flex items-center gap-2">
+                  Web Control Mode
+                  {assistantSettings.web_control_enabled && (
+                    <span className="px-2 py-0.5 bg-purple-100 text-purple-700 text-xs font-semibold rounded-full">
+                      ACTIVE
+                    </span>
+                  )}
+                </h3>
+                <p className="text-sm text-gray-600 mt-1">
+                  {assistantSettings.web_control_enabled
+                    ? '✅ Jarvis can navigate pages, start Live CCTV, and control the UI with your voice'
+                    : 'Enable to let Jarvis navigate pages and control features via voice commands'
+                  }
+                </p>
+                <p className="text-xs text-gray-400 mt-1">
+                  Example: "Go to Live CCTV", "Open Settings", "Start live monitoring"
+                </p>
+              </div>
+              <label className="relative inline-flex items-center cursor-pointer ml-4 flex-shrink-0">
+                <input
+                  type="checkbox"
+                  name="web_control_enabled"
+                  checked={assistantSettings.web_control_enabled}
+                  onChange={handleAssistantChange}
+                  className="sr-only peer"
+                />
+                <div className="relative w-14 h-8 bg-gray-300 peer-focus:ring-4 peer-focus:ring-purple-300 rounded-full peer peer-checked:after:translate-x-full rtl:peer-checked:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[4px] after:start-[4px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-6 after:w-6 after:transition-all peer-checked:bg-purple-600"></div>
+              </label>
+            </div>
+
+            {/* Voice Preference */}
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-2">
+                Voice
+              </label>
+              <div className="flex items-center gap-4">
+                <label className="flex items-center gap-2 text-sm text-gray-700">
+                  <input
+                    type="radio"
+                    name="voice"
+                    value="male"
+                    checked={assistantSettings.voice === 'male'}
+                    onChange={handleAssistantChange}
+                    className="text-purple-600 focus:ring-purple-500"
+                  />
+                  Male
+                </label>
+                <label className="flex items-center gap-2 text-sm text-gray-700">
+                  <input
+                    type="radio"
+                    name="voice"
+                    value="female"
+                    checked={assistantSettings.voice === 'female'}
+                    onChange={handleAssistantChange}
+                    className="text-purple-600 focus:ring-purple-500"
+                  />
+                  Female
+                </label>
+              </div>
+              <p className="text-xs text-gray-500 mt-1">
+                Uses installed Windows voices. If the chosen voice isn’t available, it falls back automatically.
+              </p>
+            </div>
+
+            {/* Save Button */}
+            <button
+              onClick={handleAssistantSave}
+              disabled={assistantLoading}
+              className="bg-gradient-to-r from-purple-600 to-pink-600 text-white py-3 rounded-lg font-medium hover:from-purple-700 hover:to-pink-700 focus:ring-4 focus:ring-purple-200 transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+            >
+              {assistantLoading ? (
+                <>
+                  <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                  Saving...
+                </>
+              ) : (
+                <>
+                  <Save className="w-5 h-5" />
+                  Save Assistant Settings
+                </>
+              )}
+            </button>
           </div>
         </motion.div>
       </div>

@@ -22,6 +22,7 @@ from PIL import Image
 import yaml
 from pathlib import Path
 import asyncio
+from collections import defaultdict
 
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
@@ -30,6 +31,7 @@ from models.deepfake.deepfake_detector import DeepfakeDetector
 from models.face_recognition.face_recognizer import FaceRecognizer
 from models.object_detection.yolo_detector import YOLODetector
 from utils.image_utils import draw_bbox, draw_circle, draw_text, bgr_to_rgb
+from utils.iou_tracker import IOUTracker
 
 
 class VisionPipeline:
@@ -54,6 +56,10 @@ class VisionPipeline:
         
         # Initialize all modules
         self._init_modules()
+
+        # Per-stream state for Live CCTV
+        self._stream_frame_counters = defaultdict(int)
+        self._trackers = {}
         
         print("=" * 60)
         print("✅ VisionGuard AI Pipeline Ready!")
@@ -156,6 +162,18 @@ class VisionPipeline:
             if candidate.exists():
                 model_name = str(candidate.resolve())
         weapon_confidence = obj_config.get('weapon_confidence', 0.65)
+
+        weapon_inference = obj_config.get('weapon_inference', {}) or {}
+        self.weapon_inference_mode = str(weapon_inference.get('mode', 'roi'))
+        self.weapon_inference_every_n_frames = int(weapon_inference.get('every_n_frames', 3))
+        self.weapon_inference_require_person = bool(weapon_inference.get('require_person', True))
+        self.weapon_inference_roi_padding = float(weapon_inference.get('roi_padding', 0.15))
+
+        tracking_cfg = obj_config.get('tracking', {}) or {}
+        self.tracking_enabled = bool(tracking_cfg.get('enabled', True))
+        self.tracking_iou_threshold = float(tracking_cfg.get('iou_threshold', 0.3))
+        self.tracking_max_missed = int(tracking_cfg.get('max_missed', 10))
+
         self.object_detector = YOLODetector(
             model_name=model_name,
             confidence=obj_config.get('confidence', 0.35),
@@ -172,7 +190,8 @@ class VisionPipeline:
         self,
         image: Union[str, np.ndarray, Image.Image],
         return_annotated: bool = True,
-        user_id: Optional[str] = None
+        user_id: Optional[str] = None,
+        camera_id: Optional[str] = None
     ) -> Dict:
         """
         Process a single image through the complete pipeline.
@@ -192,19 +211,46 @@ class VisionPipeline:
                 raise ValueError(f"Cannot load image: {image}")
         
         print("\n🔍 Processing Image...")
+
+        # Try to extract a face crop for deepfake detection (most deepfake models expect a face ROI)
+        deepfake_input = image
+        try:
+            faces_for_deepfake = self.face_recognizer.detect_faces(image)
+            if faces_for_deepfake:
+                def _area(b):
+                    x1, y1, x2, y2 = b
+                    return max(0, x2 - x1) * max(0, y2 - y1)
+
+                best_face = max(
+                    faces_for_deepfake,
+                    key=lambda f: (float(f.get('det_score', 0.0)), _area(f.get('bbox', [0, 0, 0, 0])))
+                )
+                x1, y1, x2, y2 = [int(v) for v in best_face.get('bbox', [0, 0, 0, 0])]
+                h, w = image.shape[:2]
+                bw, bh = max(0, x2 - x1), max(0, y2 - y1)
+                pad = int(0.15 * max(bw, bh))
+                x1 = max(0, x1 - pad)
+                y1 = max(0, y1 - pad)
+                x2 = min(w, x2 + pad)
+                y2 = min(h, y2 + pad)
+                if x2 > x1 and y2 > y1:
+                    deepfake_input = image[y1:y2, x1:x2].copy()
+        except Exception:
+            # Non-fatal: fall back to full-frame deepfake detection
+            deepfake_input = image
         
         # ====== 1. DEEPFAKE DETECTION ======
         print("   1️⃣ Deepfake Detection...")
         # Use Gemini-only mode for image analysis if configured
         if self.use_gemini_for_images and hasattr(self.deepfake_detector, 'gemini_model') and self.deepfake_detector.gemini_model:
             print("   🤖 Using Gemini API for image analysis...")
-            deepfake_result = self.deepfake_detector._predict_with_gemini(image)
-            if not deepfake_result:
-                # Fallback to primary model if Gemini fails
-                print("   ⚠️ Gemini failed, using primary model...")
-                deepfake_result = self.deepfake_detector.predict(image)
+            deepfake_result = self.deepfake_detector._predict_with_gemini(deepfake_input)
+            if (not deepfake_result) or (deepfake_result.get('label') == 'UNKNOWN'):
+                # Fallback to primary model if Gemini fails/returns unknown
+                print("   ⚠️ Gemini unavailable/uncertain, using primary model...")
+                deepfake_result = self.deepfake_detector.predict(deepfake_input)
         else:
-            deepfake_result = self.deepfake_detector.predict(image)
+            deepfake_result = self.deepfake_detector.predict(deepfake_input)
         
         # ====== 2. FACE RECOGNITION ======
         print("   2️⃣ Face Recognition...")
@@ -223,7 +269,55 @@ class VisionPipeline:
         
         # ====== 3. OBJECT DETECTION ======
         print("   3️⃣ Object Detection...")
-        object_result = self.object_detector.detect(image, return_image=False)
+        stream_key = f"{user_id or 'anon'}::{camera_id or 'default'}"
+        self._stream_frame_counters[stream_key] += 1
+        frame_index = self._stream_frame_counters[stream_key]
+
+        is_live_stream = bool(camera_id)
+        object_result = self.object_detector.detect(
+            image,
+            return_image=False,
+            frame_index=frame_index,
+            weapon_mode=(self.weapon_inference_mode if is_live_stream else 'full'),
+            weapon_every_n_frames=(self.weapon_inference_every_n_frames if is_live_stream else 1),
+            weapon_require_person=(self.weapon_inference_require_person if is_live_stream else False),
+            weapon_roi_padding=self.weapon_inference_roi_padding,
+        )
+
+        tracking = None
+        if self.tracking_enabled and camera_id:
+            tracker = self._trackers.get(stream_key)
+            if tracker is None:
+                tracker = IOUTracker(
+                    iou_threshold=self.tracking_iou_threshold,
+                    max_missed=self.tracking_max_missed,
+                )
+                self._trackers[stream_key] = tracker
+
+            person_indices: List[int] = []
+            person_boxes: List[List[int]] = []
+            for idx, obj in enumerate(object_result.get('objects', [])):
+                if obj.get('source') != 'general_model':
+                    continue
+                if str(obj.get('label', '')).lower() != 'person':
+                    continue
+                bbox = obj.get('bbox')
+                if not (isinstance(bbox, list) and len(bbox) == 4):
+                    continue
+                person_indices.append(idx)
+                person_boxes.append([int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])])
+
+            _, det_to_tid = tracker.update(person_boxes)
+            for det_i, obj_i in enumerate(person_indices):
+                tid = det_to_tid.get(det_i)
+                if tid is not None:
+                    object_result['objects'][obj_i]['track_id'] = tid
+
+            tracking = {
+                'stream_key': stream_key,
+                'frame_index': frame_index,
+                'tracks': tracker.snapshot(),
+            }
         
         # ====== 4. RISK ASSESSMENT ======
         print("   4️⃣ Risk Assessment...")
@@ -247,7 +341,8 @@ class VisionPipeline:
                 {
                     "label": obj['label'],
                     "confidence": obj['confidence'],
-                    "bbox": obj['bbox']
+                    "bbox": obj['bbox'],
+                    **({"track_id": obj["track_id"]} if "track_id" in obj else {})
                 }
                 for obj in object_result['objects']
             ],
@@ -255,7 +350,8 @@ class VisionPipeline:
                 obj['label'] for obj in object_result['suspicious_items']
             ],
             "risk_assessment": risk_result,
-            "summary": self._generate_summary(deepfake_result, face_result, object_result, risk_result)
+            "summary": self._generate_summary(deepfake_result, face_result, object_result, risk_result),
+            "tracking": tracking
         }
         
         # Generate annotated image

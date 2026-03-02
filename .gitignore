@@ -37,22 +37,11 @@ ENV/
 # Jupyter Notebook
 .ipynb_checkpoints
 
-# Model files
-*.pt
-*.pth
-*.onnx
-*.h5
-*.pb
-models/pretrained/
-weights/
-
 # Data files
 data/uploads/*
 data/outputs/*
-data/face_database/*.pkl
 data/face_database/unknown_images/*
 data/face_database/unknown_queue.json
-data/face_database/**
 !data/.gitkeep
 !logs/.gitkeep
 

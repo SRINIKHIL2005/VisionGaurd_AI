@@ -10,21 +10,31 @@ Handles all database operations for:
 """
 
 from pymongo import MongoClient, ASCENDING, DESCENDING
-from pymongo.errors import ConnectionFailure, DuplicateKeyError
+from pymongo.errors import ConnectionFailure, DuplicateKeyError, ServerSelectionTimeoutError
 from datetime import datetime, timedelta
 import numpy as np
 from typing import Dict, List, Optional, Any
 import pickle
 import base64
+import time
+import threading
 
 
 class MongoDBManager:
     """MongoDB manager for VisionGuard AI"""
-    
+
+    # How long to wait before retrying a failed connection (seconds)
+    _RETRY_INTERVAL = 30
+    # Atlas-friendly timeouts (ms)
+    _CONNECT_TIMEOUT_MS = 30000
+    _SOCKET_TIMEOUT_MS  = 30000
+    _SERVER_SEL_TIMEOUT_MS = 30000
+
     def __init__(self, connection_string: str, database_name: str = "visionguard_ai"):
         """
-        Initialize MongoDB connection.
-        
+        Initialize MongoDB connection.  Never raises — the app runs even when
+        Atlas is temporarily unreachable, and auto-reconnects in the background.
+
         Args:
             connection_string: MongoDB connection string
             database_name: Database name to use
@@ -32,50 +42,117 @@ class MongoDBManager:
         self.connection_string = connection_string
         self.database_name = database_name
         self.client = None
-        self.db = None
+        self._db = None                  # backing store for the db property
+        self.is_connected = False
+        self._connect_lock = threading.Lock()
+        self._last_attempt: float = 0.0
         self._connect()
-    
-    def _connect(self):
-        """Establish MongoDB connection and setup collections"""
+
+    # ------------------------------------------------------------------ #
+    #  Connection management                                               #
+    # ------------------------------------------------------------------ #
+
+    @property
+    def db(self):
+        """Return the live DB handle, transparently reconnecting if needed."""
+        if self._db is None or not self.is_connected:
+            self._try_reconnect_if_due()
+        return self._db
+
+    @db.setter
+    def db(self, value):
+        self._db = value
+
+    def _build_client(self) -> MongoClient:
+        """Build a MongoClient with Atlas-friendly settings, trying certifi first."""
         try:
-            # SSL/TLS configuration for Python 3.13 compatibility
             import certifi
-            import ssl
-            
-            # Try different SSL version configurations
-            # This fixes the TLS handshake issue with Python 3.13
+            return MongoClient(
+                self.connection_string,
+                serverSelectionTimeoutMS=self._SERVER_SEL_TIMEOUT_MS,
+                connectTimeoutMS=self._CONNECT_TIMEOUT_MS,
+                socketTimeoutMS=self._SOCKET_TIMEOUT_MS,
+                retryWrites=True,
+                retryReads=True,
+                tls=True,
+                tlsCAFile=certifi.where(),
+                tlsAllowInvalidCertificates=False,
+                tlsAllowInvalidHostnames=False,
+            )
+        except Exception:
+            # Fallback without strict cert check (Python 3.13 compat)
+            return MongoClient(
+                self.connection_string,
+                serverSelectionTimeoutMS=self._SERVER_SEL_TIMEOUT_MS,
+                connectTimeoutMS=self._CONNECT_TIMEOUT_MS,
+                socketTimeoutMS=self._SOCKET_TIMEOUT_MS,
+                retryWrites=True,
+                retryReads=True,
+                tls=True,
+                tlsInsecure=True,
+            )
+
+    def _connect(self):
+        """
+        Attempt to establish a MongoDB connection.
+        Never raises — sets self.is_connected accordingly.
+        """
+        with self._connect_lock:
+            self._last_attempt = time.monotonic()
             try:
-                # First attempt: Use basic TLS with certifi certificates
-                self.client = MongoClient(
-                    self.connection_string,
-                    serverSelectionTimeoutMS=10000,
-                    tls=True,
-                    tlsCAFile=certifi.where(),
-                    tlsAllowInvalidCertificates=False,
-                    tlsAllowInvalidHostnames=False
-                )
-            except Exception as e1:
-                print(f"⚠️ First connection attempt failed: {e1}")
-                # Fallback: Minimal SSL settings
-                self.client = MongoClient(
-                    self.connection_string,
-                    serverSelectionTimeoutMS=10000,
-                    tls=True,
-                    tlsInsecure=True  # Allow insecure TLS for Python 3.13
-                )
-            
-            # Test connection
-            self.client.admin.command('ping')
-            self.db = self.client[self.database_name]
-            
-            # Create collections and indexes
-            self._setup_collections()
-            
-            print(f"✅ Connected to MongoDB: {self.database_name}")
-        except ConnectionFailure as e:
-            print(f"❌ Failed to connect to MongoDB: {e}")
-            raise
+                if self.client:
+                    try:
+                        self.client.close()
+                    except Exception:
+                        pass
+
+                self.client = self._build_client()
+                self.client.admin.command('ping')
+                self._db = self.client[self.database_name]
+                self._setup_collections()
+                self.is_connected = True
+                print(f"✅ Connected to MongoDB: {self.database_name}")
+            except Exception as e:
+                self.is_connected = False
+                self._db = None
+                # Truncate the huge Atlas error to one readable line
+                short = str(e).split(',')[0].strip()
+                print(f"⚠️  MongoDB unavailable (will retry in {self._RETRY_INTERVAL}s): {short}")
+
+    def _try_reconnect_if_due(self):
+        """Reconnect only if enough time has passed since the last attempt."""
+        elapsed = time.monotonic() - self._last_attempt
+        if elapsed >= self._RETRY_INTERVAL:
+            print("[MongoDB] Attempting reconnect …")
+            self._connect()
+
+    def reconnect(self):
+        """Force an immediate reconnection attempt (call from health-check routes etc.)."""
+        self._last_attempt = 0.0
+        self._try_reconnect_if_due()
+        return self.is_connected
+
+    def ping(self) -> bool:
+        """Return True if the server is reachable right now."""
+        try:
+            if self.client:
+                self.client.admin.command('ping')
+                self.is_connected = True
+                return True
+        except Exception:
+            self.is_connected = False
+        return False
     
+    def _require_db(self, default=None):
+        """
+        Return the live db handle, or `default` if MongoDB is unavailable.
+        Triggers a lazy reconnect attempt if enough time has passed.
+        """
+        handle = self.db   # property: tries reconnect internally
+        if handle is None:
+            print("[MongoDB] DB unavailable — operation skipped.")
+        return handle
+
     def _setup_collections(self):
         """Create collections and indexes"""
         # Users Collection
@@ -150,6 +227,11 @@ class MongoDBManager:
                     'cooldown_minutes': 3,
                     'retention_days': 10
                 },
+                'assistant_settings': {
+                    'enabled': False,
+                    'name': 'Jarvis',
+                    'voice': 'male',
+                },
                 'camera_locations': {},
             }
             
@@ -168,43 +250,84 @@ class MongoDBManager:
     
     def get_user_by_email(self, email: str) -> Optional[Dict]:
         """Get user by email"""
-        return self.db.users.find_one({'email': email.lower()})
-    
+        db = self._require_db()
+        if db is None:
+            return None
+        try:
+            return db.users.find_one({'email': email.lower()})
+        except Exception as e:
+            print(f"[MongoDB] get_user_by_email failed: {e}")
+            return None
+
     def get_user_by_id(self, user_id: str) -> Optional[Dict]:
         """Get user by ID"""
-        from bson.objectid import ObjectId
-        return self.db.users.find_one({'_id': ObjectId(user_id)})
+        db = self._require_db()
+        if db is None:
+            return None
+        try:
+            from bson.objectid import ObjectId
+            return db.users.find_one({'_id': ObjectId(user_id)})
+        except Exception as e:
+            print(f"[MongoDB] get_user_by_id failed: {e}")
+            return None
     
     def update_user(self, user_id: str, update_data: Dict) -> bool:
         """
         Update user information.
-        
+
         Args:
             user_id: User's ID
             update_data: Data to update
-            
+
         Returns:
             Success status
         """
-        from bson.objectid import ObjectId
-        update_data['updated_at'] = datetime.utcnow()
-        result = self.db.users.update_one(
-            {'_id': ObjectId(user_id)},
-            {'$set': update_data}
-        )
-        return result.modified_count > 0
-    
+        db = self._require_db()
+        if db is None:
+            return False
+        try:
+            from bson.objectid import ObjectId
+            update_data['updated_at'] = datetime.utcnow()
+            result = db.users.update_one(
+                {'_id': ObjectId(user_id)},
+                {'$set': update_data}
+            )
+            return result.modified_count > 0
+        except Exception as e:
+            print(f"[MongoDB] update_user failed: {e}")
+            return False
+
     def update_telegram_settings(self, user_id: str, telegram_settings: Dict) -> bool:
         """Update user's Telegram bot settings"""
-        from bson.objectid import ObjectId
-        result = self.db.users.update_one(
-            {'_id': ObjectId(user_id)},
-            {'$set': {
-                'telegram_settings': telegram_settings,
-                'updated_at': datetime.utcnow()
-            }}
-        )
-        return result.modified_count > 0
+        db = self._require_db()
+        if db is None:
+            return False
+        try:
+            from bson.objectid import ObjectId
+            result = db.users.update_one(
+                {'_id': ObjectId(user_id)},
+                {'$set': {'telegram_settings': telegram_settings, 'updated_at': datetime.utcnow()}}
+            )
+            return result.modified_count > 0
+        except Exception as e:
+            print(f"[MongoDB] update_telegram_settings failed: {e}")
+            return False
+
+    def update_assistant_settings(self, user_id: str, assistant_settings: Dict) -> bool:
+        """Update user's AI assistant settings (enabled/name)."""
+        db = self._require_db()
+        if db is None:
+            return False
+        try:
+            from bson.objectid import ObjectId
+            result = db.users.update_one(
+                {'_id': ObjectId(user_id)},
+                {'$set': {'assistant_settings': assistant_settings, 'updated_at': datetime.utcnow()}}
+            )
+            return result.modified_count > 0
+        except Exception as e:
+            print(f"[MongoDB] update_assistant_settings failed: {e}")
+            return False
     
     # ===== Face Database Operations =====
     
@@ -247,60 +370,81 @@ class MongoDBManager:
     
     def get_face(self, user_id: str, name: str) -> Optional[Dict]:
         """Get face by name for specific user"""
-        doc = self.db.face_database.find_one({'user_id': user_id, 'name': name})
-        if doc:
-            # Convert embedding back to numpy array
-            embedding_bytes = base64.b64decode(doc['embedding'])
-            doc['embedding'] = pickle.loads(embedding_bytes)
-        return doc
-    
+        db = self._require_db()
+        if db is None:
+            return None
+        try:
+            doc = db.face_database.find_one({'user_id': user_id, 'name': name})
+            if doc:
+                embedding_bytes = base64.b64decode(doc['embedding'])
+                doc['embedding'] = pickle.loads(embedding_bytes)
+            return doc
+        except Exception as e:
+            print(f"[MongoDB] get_face failed: {e}")
+            return None
+
     def get_all_faces(self, user_id: str) -> Dict[str, Dict]:
         """
         Get all faces from database for specific user.
-        
+
         Args:
             user_id: User's ID
-            
+
         Returns:
             Dictionary {name: {embedding, metadata}}
         """
-        faces = {}
-        for doc in self.db.face_database.find({'user_id': user_id}):
-            # Convert embedding back to numpy array
-            embedding_bytes = base64.b64decode(doc['embedding'])
-            embedding = pickle.loads(embedding_bytes)
-            
-            faces[doc['name']] = {
-                'embedding': embedding,
-                'metadata': doc['metadata']
-            }
-        return faces
-    
+        db = self._require_db()
+        if db is None:
+            return {}
+        try:
+            faces = {}
+            for doc in db.face_database.find({'user_id': user_id}):
+                embedding_bytes = base64.b64decode(doc['embedding'])
+                embedding = pickle.loads(embedding_bytes)
+                faces[doc['name']] = {'embedding': embedding, 'metadata': doc['metadata']}
+            return faces
+        except Exception as e:
+            print(f"[MongoDB] get_all_faces failed: {e}")
+            return {}
+
     def remove_face(self, user_id: str, name: str) -> bool:
         """Remove face from database for specific user"""
-        result = self.db.face_database.delete_one({'user_id': user_id, 'name': name})
-        return result.deleted_count > 0
+        db = self._require_db()
+        if db is None:
+            return False
+        try:
+            result = db.face_database.delete_one({'user_id': user_id, 'name': name})
+            return result.deleted_count > 0
+        except Exception as e:
+            print(f"[MongoDB] remove_face failed: {e}")
+            return False
     
     def list_identities(self, user_id: str, detailed: bool = False) -> List:
         """List all identities for specific user"""
-        if detailed:
-            identities = []
-            for doc in self.db.face_database.find({'user_id': user_id}).sort('created_at', DESCENDING):
-                identity = {
-                    'name': doc['name'],
-                    'added_date': doc['metadata'].get('added_date', 'Unknown'),
-                    'approved_by': doc['metadata'].get('approved_by', 'Unknown'),
-                    'camera_location': doc['metadata'].get('camera_location', 'Unknown'),
-                    'photo_path': doc['metadata'].get('photo_path'),
-                    'telegram_user_id': doc['metadata'].get('telegram_user_id'),
-                    'telegram_username': doc['metadata'].get('telegram_username'),
-                    'telegram_first_name': doc['metadata'].get('telegram_first_name'),
-                    'telegram_last_name': doc['metadata'].get('telegram_last_name'),
-                }
-                identities.append(identity)
-            return identities
-        else:
-            return [doc['name'] for doc in self.db.face_database.find({'user_id': user_id})]
+        db = self._require_db()
+        if db is None:
+            return []
+        try:
+            if detailed:
+                identities = []
+                for doc in db.face_database.find({'user_id': user_id}).sort('created_at', DESCENDING):
+                    identities.append({
+                        'name': doc['name'],
+                        'added_date': doc['metadata'].get('added_date', 'Unknown'),
+                        'approved_by': doc['metadata'].get('approved_by', 'Unknown'),
+                        'camera_location': doc['metadata'].get('camera_location', 'Unknown'),
+                        'photo_path': doc['metadata'].get('photo_path'),
+                        'telegram_user_id': doc['metadata'].get('telegram_user_id'),
+                        'telegram_username': doc['metadata'].get('telegram_username'),
+                        'telegram_first_name': doc['metadata'].get('telegram_first_name'),
+                        'telegram_last_name': doc['metadata'].get('telegram_last_name'),
+                    })
+                return identities
+            else:
+                return [doc['name'] for doc in db.face_database.find({'user_id': user_id})]
+        except Exception as e:
+            print(f"[MongoDB] list_identities failed: {e}")
+            return []
     
     # ===== Detection History Operations =====
     
@@ -328,19 +472,32 @@ class MongoDBManager:
             'risk_score': detection_data.get('risk_score', 0.0),
             'image_path': detection_data.get('image_path'),
         }
-        result = self.db.detection_history.insert_one(doc)
-        return str(result.inserted_id)
-    
+        db = self._require_db()
+        if db is None:
+            return 'offline'
+        try:
+            result = db.detection_history.insert_one(doc)
+            return str(result.inserted_id)
+        except Exception as e:
+            print(f"[MongoDB] log_detection failed: {e}")
+            return 'error'
+
     def get_detection_history(self, user_id: str, limit: int = 100, camera_location: Optional[str] = None,
                               start_date: Optional[datetime] = None) -> List[Dict]:
         """Get detection history with filters for specific user"""
-        query = {'user_id': user_id}
-        if camera_location:
-            query['camera_location'] = camera_location
-        if start_date:
-            query['timestamp'] = {'$gte': start_date}
-        
-        return list(self.db.detection_history.find(query).sort('timestamp', DESCENDING).limit(limit))
+        db = self._require_db()
+        if db is None:
+            return []
+        try:
+            query = {'user_id': user_id}
+            if camera_location:
+                query['camera_location'] = camera_location
+            if start_date:
+                query['timestamp'] = {'$gte': start_date}
+            return list(db.detection_history.find(query).sort('timestamp', DESCENDING).limit(limit))
+        except Exception as e:
+            print(f"[MongoDB] get_detection_history failed: {e}")
+            return []
     
     # ===== Telegram Interactions =====
     
@@ -368,12 +525,26 @@ class MongoDBManager:
             'response': interaction_data.get('response'),
             'approved_name': interaction_data.get('approved_name'),
         }
-        result = self.db.telegram_interactions.insert_one(doc)
-        return str(result.inserted_id)
-    
+        db = self._require_db()
+        if db is None:
+            return 'offline'
+        try:
+            result = db.telegram_interactions.insert_one(doc)
+            return str(result.inserted_id)
+        except Exception as e:
+            print(f"[MongoDB] log_telegram_interaction failed: {e}")
+            return 'error'
+
     def get_telegram_history(self, user_id: str, limit: int = 100) -> List[Dict]:
         """Get Telegram interaction history for specific user"""
-        return list(self.db.telegram_interactions.find({'user_id': user_id}).sort('timestamp', DESCENDING).limit(limit))
+        db = self._require_db()
+        if db is None:
+            return []
+        try:
+            return list(db.telegram_interactions.find({'user_id': user_id}).sort('timestamp', DESCENDING).limit(limit))
+        except Exception as e:
+            print(f"[MongoDB] get_telegram_history failed: {e}")
+            return []
     
     # ===== Analysis History =====
     
@@ -400,16 +571,29 @@ class MongoDBManager:
             'processing_time': analysis_data.get('processing_time'),
             'source_path': analysis_data.get('source_path'),
         }
-        result = self.db.analysis_history.insert_one(doc)
-        return str(result.inserted_id)
-    
+        db = self._require_db()
+        if db is None:
+            return 'offline'
+        try:
+            result = db.analysis_history.insert_one(doc)
+            return str(result.inserted_id)
+        except Exception as e:
+            print(f"[MongoDB] log_analysis failed: {e}")
+            return 'error'
+
     def get_analysis_history(self, user_id: str, limit: int = 100, analysis_type: Optional[str] = None) -> List[Dict]:
         """Get analysis history for specific user"""
-        query = {'user_id': user_id}
-        if analysis_type:
-            query['analysis_type'] = analysis_type
-        
-        return list(self.db.analysis_history.find(query).sort('timestamp', DESCENDING).limit(limit))
+        db = self._require_db()
+        if db is None:
+            return []
+        try:
+            query = {'user_id': user_id}
+            if analysis_type:
+                query['analysis_type'] = analysis_type
+            return list(db.analysis_history.find(query).sort('timestamp', DESCENDING).limit(limit))
+        except Exception as e:
+            print(f"[MongoDB] get_analysis_history failed: {e}")
+            return []
     
     # ===== User Actions =====
     
@@ -431,28 +615,52 @@ class MongoDBManager:
             'details': action_data.get('details'),
             'ip_address': action_data.get('ip_address'),
         }
-        result = self.db.user_actions.insert_one(doc)
-        return str(result.inserted_id)
+        db = self._require_db()
+        if db is None:
+            return 'offline'
+        try:
+            result = db.user_actions.insert_one(doc)
+            return str(result.inserted_id)
+        except Exception as e:
+            print(f"[MongoDB] log_user_action failed: {e}")
+            return 'error'
     
     # ===== Statistics =====
     
     def get_statistics(self, user_id: str) -> Dict:
         """Get database statistics for specific user"""
-        return {
-            'total_faces': self.db.face_database.count_documents({'user_id': user_id}),
-            'total_detections': self.db.detection_history.count_documents({'user_id': user_id}),
-            'total_telegram_interactions': self.db.telegram_interactions.count_documents({'user_id': user_id}),
-            'total_analyses': self.db.analysis_history.count_documents({'user_id': user_id}),
-            'total_user_actions': self.db.user_actions.count_documents({'user_id': user_id}),
-            'recent_detections_24h': self.db.detection_history.count_documents({
-                'user_id': user_id,
-                'timestamp': {'$gte': datetime.utcnow() - timedelta(days=1)}
-            }),
-            'high_risk_detections': self.db.detection_history.count_documents({
-                'user_id': user_id,
-                'risk_level': 'high'
-            }),
-        }
+        db = self._require_db()
+        if db is None:
+            return {
+                'total_faces': 0, 'total_detections': 0,
+                'total_telegram_interactions': 0, 'total_analyses': 0,
+                'total_user_actions': 0, 'recent_detections_24h': 0,
+                'high_risk_detections': 0, 'db_status': 'offline',
+            }
+        try:
+            return {
+                'total_faces': db.face_database.count_documents({'user_id': user_id}),
+                'total_detections': db.detection_history.count_documents({'user_id': user_id}),
+                'total_telegram_interactions': db.telegram_interactions.count_documents({'user_id': user_id}),
+                'total_analyses': db.analysis_history.count_documents({'user_id': user_id}),
+                'total_user_actions': db.user_actions.count_documents({'user_id': user_id}),
+                'recent_detections_24h': db.detection_history.count_documents({
+                    'user_id': user_id,
+                    'timestamp': {'$gte': datetime.utcnow() - timedelta(days=1)}
+                }),
+                'high_risk_detections': db.detection_history.count_documents({
+                    'user_id': user_id, 'risk_level': 'high'
+                }),
+                'db_status': 'online',
+            }
+        except Exception as e:
+            print(f"[MongoDB] get_statistics failed: {e}")
+            return {
+                'total_faces': 0, 'total_detections': 0,
+                'total_telegram_interactions': 0, 'total_analyses': 0,
+                'total_user_actions': 0, 'recent_detections_24h': 0,
+                'high_risk_detections': 0, 'db_status': 'error',
+            }
     
     def close(self):
         """Close MongoDB connection"""

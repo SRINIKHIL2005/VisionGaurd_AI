@@ -5,12 +5,19 @@
 
 import axios from 'axios';
 
-const API_URL = 'http://localhost:8000';
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
 // Token storage keys
 const ACCESS_TOKEN_KEY = 'visionguard_access_token';
 const REFRESH_TOKEN_KEY = 'visionguard_refresh_token';
 const USER_KEY = 'visionguard_user';
+
+// Dedicated client for authenticated calls — no baseURL so requests route
+// through the Vite proxy as relative paths (avoids port mismatch issues).
+const authAxios = axios.create();
+
+// Raw client with no interceptors (used for refresh to avoid loops)
+const rawAxios = axios.create();
 
 class AuthService {
   /**
@@ -169,35 +176,49 @@ class AuthService {
    * Get axios instance with auth header
    */
   getAuthAxios() {
-    const token = this.getAccessToken();
-    return axios.create({
-      baseURL: API_URL,
-      headers: token ? { Authorization: `Bearer ${token}` } : {}
-    });
+    return authAxios;
   }
 }
 
 // Create singleton instance
 const authService = new AuthService();
 
-// Setup axios interceptor for automatic token refresh
-axios.interceptors.response.use(
+// Attach interceptors to the authenticated client.
+authAxios.interceptors.request.use((config) => {
+  const token = authService.getAccessToken();
+  if (token) {
+    config.headers = config.headers || {};
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+
+authAxios.interceptors.response.use(
   (response) => response,
   async (error) => {
     const originalRequest = error.config;
 
-    // If error is 401 and we haven't retried yet
-    if (error.response?.status === 401 && !originalRequest._retry) {
+    if (error.response?.status === 401 && originalRequest && !originalRequest._retry) {
       originalRequest._retry = true;
 
       try {
-        // Try to refresh token
-        const newToken = await authService.refreshToken();
-        
-        // Retry original request with new token
-        originalRequest.headers.Authorization = `Bearer ${newToken}`;
-        return axios(originalRequest);
+        const refreshToken = authService.getRefreshToken();
+        if (!refreshToken) {
+          authService.logout();
+          return Promise.reject(error);
+        }
+
+        const refreshRes = await rawAxios.post('/auth/refresh', {
+          refresh_token: refreshToken,
+        });
+
+        authService.setTokens(refreshRes.data.access_token, refreshRes.data.refresh_token);
+
+        originalRequest.headers = originalRequest.headers || {};
+        originalRequest.headers.Authorization = `Bearer ${refreshRes.data.access_token}`;
+        return authAxios(originalRequest);
       } catch (refreshError) {
+        authService.logout();
         return Promise.reject(refreshError);
       }
     }

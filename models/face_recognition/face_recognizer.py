@@ -185,14 +185,15 @@ class FaceRecognizer:
         Returns:
             BGR numpy array
         """
+        # If a PIL Image is provided, it is in RGB; convert to BGR for OpenCV/InsightFace.
         if isinstance(image, Image.Image):
-            image = np.array(image)
-        
-        # Convert RGB to BGR if needed
-        if len(image.shape) == 3 and image.shape[2] == 3:
-            # Assume RGB, convert to BGR
-            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-        
+            rgb = np.array(image)
+            if len(rgb.shape) == 3 and rgb.shape[2] == 3:
+                return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            return rgb
+
+        # In this project, numpy arrays typically come from OpenCV (cv2.imread/cv2.imdecode)
+        # and are already BGR. Do not channel-swap here.
         return image
     
     def detect_faces(self, image: Union[np.ndarray, Image.Image]) -> List[Dict]:

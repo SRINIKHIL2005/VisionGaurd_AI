@@ -25,6 +25,9 @@ from typing import Optional, List
 import sys
 import os
 import asyncio
+import tempfile
+import threading
+import concurrent.futures
 from datetime import datetime
 from pathlib import Path
 import cv2
@@ -35,8 +38,27 @@ import json
 import base64
 import yaml
 
+try:
+    import edge_tts  # Microsoft neural TTS (free, online)
+except Exception:
+    edge_tts = None
+
+try:
+    import pyttsx3  # pyright: ignore[reportMissingImports]  # offline TTS fallback
+except Exception:
+    pyttsx3 = None
+
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
+
+# RAG + Gemini assistant (imported AFTER sys.path is set so 'utils' resolves)
+try:
+    from utils.rag_engine import RAGEngine
+    from utils.llm_client import GeminiClient
+except Exception as _rag_import_err:
+    RAGEngine = None  # type: ignore
+    GeminiClient = None  # type: ignore
+    print(f"[Assistant] RAG/LLM import failed: {_rag_import_err}")
 
 from pipeline.vision_pipeline import VisionPipeline
 from utils.telegram_notifier import get_notifier, initialize_notifier, shutdown_notifier
@@ -69,6 +91,34 @@ app.add_middleware(
 # ===== Global Pipeline Instance =====
 pipeline: Optional[VisionPipeline] = None
 
+# ── Edge TTS (primary) ───────────────────────────────────────────────────────
+EDGE_VOICES = {
+    'male':   'en-US-GuyNeural',
+    'female': 'en-US-JennyNeural',
+}
+
+async def _synthesize_edge_tts(text: str, voice_pref: str = 'male') -> Optional[bytes]:
+    """Synthesize speech using Microsoft Edge TTS. Returns MP3 bytes."""
+    if edge_tts is None or not text:
+        return None
+    voice = EDGE_VOICES.get(voice_pref, EDGE_VOICES['male'])
+    try:
+        communicate = edge_tts.Communicate(text, voice)
+        chunks = []
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                chunks.append(chunk["data"])
+        data = b"".join(chunks)
+        return data if data else None
+    except Exception as e:
+        print(f"[TTS] edge_tts failed: {e}")
+        return None
+
+# ── pyttsx3 (offline fallback) ────────────────────────────────────────────────
+_tts_engine = None
+_tts_lock = threading.Lock()
+_tts_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="vg_tts")
+
 # Live notification throttle (per user)
 _last_live_telegram_enqueue_at: dict = {}
 
@@ -77,16 +127,40 @@ _last_live_telegram_enqueue_at: dict = {}
 _ANALYZE_CONCURRENCY = int(os.getenv("VG_ANALYZE_CONCURRENCY", "1"))
 _analyze_semaphore = asyncio.Semaphore(max(1, _ANALYZE_CONCURRENCY))
 
+# Module-level RAG + Gemini singletons (initialised in startup_event)
+rag_engine = None
+gemini_client = None
+
 
 # ===== Startup Event =====
 @app.on_event("startup")
 async def startup_event():
-    """Initialize pipeline and Telegram bot on startup"""
-    global pipeline
+    """Initialize pipeline, RAG engine, and Gemini client on startup"""
+    global pipeline, rag_engine, gemini_client
     print("\n🚀 Starting VisionGuard AI API...")
     pipeline = VisionPipeline(config_path="config/settings.yaml")
+
+    # ── RAG + Gemini assistant ─────────────────────────────────────────────
+    try:
+        assistant_cfg = pipeline.config.get('assistant', {})
+        api_key = (assistant_cfg.get('gemini_api_key') or '').strip()
+        if api_key and RAGEngine is not None and GeminiClient is not None:
+            model_name = assistant_cfg.get('gemini_model', 'gemini-2.0-flash')
+            gemini_client = GeminiClient(api_key, model_name)
+            rag_engine = RAGEngine(pipeline.mongodb_manager, assistant_cfg)
+            default_uid = (pipeline.config.get('mongodb', {}).get('default_user_id') or '').strip()
+            if default_uid:
+                rag_engine.build_index(default_uid)
+                print(f"✅ RAG index built ({len(rag_engine._log_texts)} logs)")
+        else:
+            if not api_key:
+                print("⚠️  No Gemini API key in settings.yaml — assistant uses fallback responses")
+    except Exception as _e:
+        print(f"⚠️  Assistant init failed: {_e}")
+    # ──────────────────────────────────────────────────────────────────────
+
     print("✅ API Ready!\n")
-    
+
     # Telegram is initialized on-demand per user via /user/telegram-settings
     # (avoids multiple instances and ensures user-specific credentials)
 
@@ -164,6 +238,21 @@ class TelegramSettingsRequest(BaseModel):
 class TelegramMessageRequest(BaseModel):
     """Simple Telegram message request"""
     message: str
+    
+class AssistantSettingsRequest(BaseModel):
+    """AI Assistant settings update request"""
+    enabled: bool = False
+    name: str = "Jarvis"  # kept for backward compatibility; ignored
+    voice: str = "male"  # 'male' | 'female'
+    web_control_enabled: bool = False  # Allow Jarvis to navigate UI and control features
+
+
+class AssistantNarrateRequest(BaseModel):
+    """Request for generating a short narration from an analysis result."""
+    analysis: dict
+    user_query: Optional[str] = ""
+    page_context: Optional[dict] = None  # { current_page, live_cctv_active, web_control_enabled }
+    frame_base64: Optional[str] = None  # annotated JPEG frame as base64 (from live CCTV)
 
 
 # ===== Helper Functions =====
@@ -202,6 +291,94 @@ def encode_image(image: np.ndarray) -> str:
     _, buffer = cv2.imencode('.jpg', image)
     img_base64 = base64.b64encode(buffer).decode('utf-8')
     return img_base64
+
+
+def _get_tts_engine():
+    global _tts_engine
+    if _tts_engine is None:
+        if pyttsx3 is None:
+            return None
+        _tts_engine = pyttsx3.init()
+    return _tts_engine
+
+
+def _synthesize_speech_wav_bytes(text: str) -> Optional[bytes]:
+    """Synthesize speech to WAV bytes (offline)."""
+    return _synthesize_speech_wav_bytes_with_voice(text, "male")
+
+
+def _select_voice_id(engine, preference: str) -> Optional[str]:
+    """Pick a voice id from installed voices based on a coarse preference."""
+    try:
+        voices = engine.getProperty('voices') or []
+    except Exception:
+        voices = []
+
+    pref = (preference or 'male').strip().lower()
+    if pref not in {'male', 'female'}:
+        pref = 'male'
+
+    def voice_text(v):
+        try:
+            return f"{getattr(v, 'name', '')} {getattr(v, 'id', '')}".lower()
+        except Exception:
+            return ""
+
+    # First pass: explicit gender keywords
+    key = 'female' if pref == 'female' else 'male'
+    for v in voices:
+        if key in voice_text(v):
+            return getattr(v, 'id', None)
+
+    # Second pass: common Windows SAPI voice names (best-effort)
+    if pref == 'female':
+        hints = ['zira', 'hazel', 'susan', 'helen', 'catherine', 'eva', 'jenny', 'aria']
+    else:
+        hints = ['david', 'mark', 'george', 'james', 'guy', 'ryan']
+
+    for hint in hints:
+        for v in voices:
+            if hint in voice_text(v):
+                return getattr(v, 'id', None)
+
+    return None
+
+
+def _synthesize_speech_wav_bytes_with_voice(text: str, preference: str) -> Optional[bytes]:
+    if not text:
+        return None
+    if pyttsx3 is None:
+        return None
+
+    with _tts_lock:
+        engine = _get_tts_engine()
+        if engine is None:
+            return None
+
+        # IMPORTANT: Per project constraint, do not delete temp files via os.remove.
+        # Use a deterministic temp path and overwrite it each time.
+        tmp_path = os.path.join(tempfile.gettempdir(), f"visionguard_tts_{os.getpid()}.wav")
+        try:
+            try:
+                voice_id = _select_voice_id(engine, preference)
+                if voice_id:
+                    engine.setProperty('voice', voice_id)
+            except Exception:
+                pass
+
+            try:
+                engine.stop()
+            except Exception:
+                pass
+
+            engine.save_to_file(text, tmp_path)
+            engine.runAndWait()
+
+            with open(tmp_path, "rb") as f:
+                return f.read()
+        finally:
+            # Intentionally do not delete tmp_path
+            pass
 
 
 # ===== API Endpoints =====
@@ -392,6 +569,450 @@ async def get_telegram_settings(current_user: dict = Depends(get_current_user)):
         }
     }
 
+# ===== User Settings (AI Assistant) =====
+
+@app.get("/user/assistant-settings", tags=["User"])
+async def get_assistant_settings(current_user: dict = Depends(get_current_user)):
+    """Get current user's AI assistant settings."""
+    if pipeline is None or not hasattr(pipeline, 'mongodb_manager') or pipeline.mongodb_manager is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    user = pipeline.mongodb_manager.get_user_by_id(current_user['user_id'])
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    settings = user.get('assistant_settings') or {
+        'enabled': False,
+        'name': 'Jarvis',
+        'voice': 'male',
+    }
+
+    name = 'Jarvis'
+    voice = (settings.get('voice') or 'male').strip().lower()
+    if voice not in {'male', 'female'}:
+        voice = 'male'
+
+    return {
+        "settings": {
+            "enabled": bool(settings.get('enabled', False)),
+            "name": name,
+            "voice": voice,
+            "web_control_enabled": bool(settings.get('web_control_enabled', False)),
+        }
+    }
+
+
+@app.put("/user/assistant-settings", tags=["User"])
+async def update_assistant_settings(
+    request: AssistantSettingsRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Update current user's AI assistant settings."""
+    if pipeline is None or not hasattr(pipeline, 'mongodb_manager') or pipeline.mongodb_manager is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    name = "Jarvis"
+
+    voice = (request.voice or 'male').strip().lower()
+    if voice not in {'male', 'female'}:
+        raise HTTPException(status_code=400, detail="voice must be 'male' or 'female'")
+
+    settings_doc = {
+        'enabled': bool(request.enabled),
+        'name': name,
+        'voice': voice,
+        'web_control_enabled': bool(request.web_control_enabled),
+    }
+
+    ok = pipeline.mongodb_manager.update_assistant_settings(current_user['user_id'], settings_doc)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to update assistant settings")
+
+    return {"message": "Assistant settings updated", "settings": settings_doc}
+
+
+@app.post("/assistant/narrate", tags=["Assistant"])
+async def assistant_narrate(
+    request: AssistantNarrateRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Generate a short Jarvis-style narration from the current live analysis.
+
+    Note: This is template-based (no LLM). It is designed so we can later
+    swap in a local LLM using the same structured summary.
+    """
+    if pipeline is None or not hasattr(pipeline, 'mongodb_manager') or pipeline.mongodb_manager is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    mgr = pipeline.mongodb_manager
+    user = mgr.get_user_by_id(current_user['user_id'])
+    if not user:
+        if not mgr.is_connected:
+            # DB is temporarily unreachable — degrade gracefully with defaults
+            assistant_settings = {'enabled': True, 'name': 'Jarvis', 'voice': 'male'}
+        else:
+            raise HTTPException(status_code=404, detail="User not found")
+    else:
+        assistant_settings = user.get('assistant_settings') or {'enabled': False, 'name': 'Jarvis'}
+    if not assistant_settings.get('enabled', False):
+        raise HTTPException(status_code=400, detail="AI Assistant is disabled in Settings")
+
+    assistant_name = (assistant_settings.get('name') or 'Jarvis').strip() or 'Jarvis'
+    assistant_voice = (assistant_settings.get('voice') or 'male').strip().lower()
+    if assistant_voice not in {'male', 'female'}:
+        assistant_voice = 'male'
+
+    user_query = (request.user_query or "").strip()
+    analysis   = request.analysis or {}
+    frame_b64  = (request.frame_base64 or "").strip() or None
+
+    # ── Web UI Action Detection ───────────────────────────────────────────────────
+    page_ctx      = request.page_context or {}
+    current_page  = page_ctx.get('current_page', '/')
+    live_active   = bool(page_ctx.get('live_cctv_active', False))
+    # Use DB value as source of truth (so stale frontend sessions still work)
+    web_ctrl      = bool(assistant_settings.get('web_control_enabled', page_ctx.get('web_control_enabled', False)))
+
+    _PAGE_NAMES = {
+        '/': 'Dashboard', '/image': 'Image Analysis', '/video': 'Video Analysis',
+        '/live': 'Live CCTV', '/database': 'Face Database', '/settings': 'Settings',
+    }
+    _PAGES = {
+        'dashboard': '/', 'home': '/',
+        'image analysis': '/image', 'image': '/image',
+        'video analysis': '/video', 'video': '/video',
+        'live cctv': '/live', 'live': '/live', 'cctv': '/live', 'camera': '/live',
+        'face database': '/database', 'database': '/database', 'faces': '/database', 'face': '/database',
+        'settings': '/settings', 'setting': '/settings',
+    }
+    _NAV_VERBS = ['go to', 'navigate to', 'open', 'show me', 'take me to', 'switch to', 'launch', 'visit']
+    _LIVE_ON   = [
+        'start live', 'turn on live', 'on the live', 'enable live', 'activate live',
+        'begin live', 'start cctv', 'start monitoring', 'turn on cctv', 'start camera',
+        'start the live', 'on live', 'open live cctv',
+        # common spoken variants
+        'on the cctv', 'on cctv', 'ok on the cctv', 'turn on the cctv', 'turn on the live',
+        'open the live', 'start the cctv', 'open cctv', 'begin cctv', 'activate cctv',
+        'enable cctv', 'on camera', 'start camera feed', 'start the camera',
+    ]
+    _LIVE_OFF  = [
+        'stop live', 'turn off live', 'off the live', 'disable live',
+        'stop monitoring', 'stop cctv', 'turn off cctv', 'stop camera',
+        'off the cctv', 'off cctv', 'turn off the cctv', 'close cctv',
+        'close live', 'stop the live', 'stop the cctv', 'disable cctv',
+    ]
+
+    jarvis_action = {"type": "none"}
+    action_desc   = ""
+
+    if web_ctrl and user_query:
+        q = user_query.lower()
+        has_nav_verb = any(kw in q for kw in _NAV_VERBS)
+
+        # Live CCTV start/stop takes priority (most explicit intent)
+        if any(p in q for p in _LIVE_ON):
+            jarvis_action = {"type": "navigate_and_start_live"}
+            action_desc   = "Navigating to Live CCTV and starting the monitoring feed."
+        elif any(p in q for p in _LIVE_OFF):
+            jarvis_action = {"type": "stop_live_cctv"}
+            action_desc   = "Stopping the Live CCTV monitoring feed."
+        elif has_nav_verb:
+            # Try longest page keywords first to avoid 'image' matching in 'image analysis'
+            for page_kw in sorted(_PAGES, key=len, reverse=True):
+                if page_kw in q:
+                    path = _PAGES[page_kw]
+                    jarvis_action = {"type": "navigate", "path": path}
+                    action_desc   = f"Navigating to {_PAGE_NAMES.get(path, path)}."
+                    break
+        else:
+            # Bare page name with no verb (e.g. "live cctv", "settings")
+            for page_kw in sorted(_PAGES, key=len, reverse=True):
+                if page_kw == q.strip() or (page_kw in q and len(q.split()) <= 4):
+                    path = _PAGES[page_kw]
+                    jarvis_action = {"type": "navigate", "path": path}
+                    action_desc   = f"Navigating to {_PAGE_NAMES.get(path, path)}."
+                    break
+
+    def _build_ui_context() -> str:
+        lines = [
+            "=== WEB INTERFACE STATE ===",
+            f"Current page the user is viewing: {_PAGE_NAMES.get(current_page, current_page)}",
+            f"Live CCTV monitoring: {'ACTIVE — camera feed is running and analysis data below is LIVE' if live_active else 'INACTIVE — camera feed is NOT running, NO real scene data available'}",
+            "Pages available in the app: Dashboard, Image Analysis, Video Analysis, Live CCTV, Face Database, Settings.",
+        ]
+        if not live_active:
+            lines.append(
+                "IMPORTANT: Since Live CCTV is NOT active, the camera analysis data below is empty/stale. "
+                "Do NOT describe any scene or say 'the area is clear' — you have no real visual data. "
+                "If the user asks what you see, say the camera isn't on yet."
+            )
+        if web_ctrl:
+            lines.append("Web Control Mode: ENABLED — you CAN navigate pages and toggle Live CCTV for the user.")
+            if action_desc:
+                lines.append(f"Action you are performing right now: {action_desc}")
+            else:
+                lines.append("No UI action needed for this query.")
+        else:
+            lines.append(
+                "Web Control Mode: DISABLED — if the user asks to navigate pages or control the UI, "
+                "tell them to go to Settings → AI Assistant and enable 'Web Control Mode' first."
+            )
+        return "\n".join(lines)
+
+    # ── Build rich scene context (structured data for Gemini scene understanding) ───
+    risk          = analysis.get('risk_assessment') or {}
+    threats       = risk.get('threats') or {}
+    risk_level    = str(risk.get('risk_level') or 'LOW').upper()
+    overall_score = risk.get('overall_score')
+    face          = analysis.get('face_recognition') or {}
+    identity      = (face.get('identity') or '').strip()
+    objects       = analysis.get('objects') or []
+    suspicious    = analysis.get('suspicious_objects') or []
+    threat_cat    = risk.get('threat_category') or 'NONE'
+    deepfake      = analysis.get('deepfake_detection') or {}
+
+    # Count and collect all detected object labels
+    object_labels = []
+    for obj in objects:
+        lbl = (obj.get('label') or obj.get('class') or '').strip().lower()
+        if lbl:
+            object_labels.append(lbl)
+
+    from collections import Counter
+    label_counts = Counter(object_labels)
+    num_people = label_counts.get('person', 0)
+
+    # Separate persons and weapons with their bboxes for spatial association
+    person_objs  = [o for o in objects if (o.get('label') or o.get('class') or '').lower() == 'person']
+    weapon_labels_set = {'grenade', 'knife', 'pistol', 'rifle', 'gun', 'weapon'}
+    weapon_objs  = [
+        o for o in objects
+        if (o.get('label') or o.get('class') or '').lower() in weapon_labels_set
+        or o.get('is_weapon')
+    ]
+
+    def _bbox_center(bbox):
+        x1, y1, x2, y2 = bbox
+        return ((x1 + x2) / 2, (y1 + y2) / 2)
+
+    def _point_in_expanded_bbox(cx, cy, bbox, expand=0.35):
+        """Check if point (cx,cy) falls within a person bbox expanded by `expand` fraction."""
+        x1, y1, x2, y2 = bbox
+        w, h  = max(1, x2 - x1), max(1, y2 - y1)
+        ex1   = x1 - w * expand
+        ey1   = y1 - h * expand
+        ex2   = x2 + w * expand
+        ey2   = y2 + h * expand
+        return ex1 <= cx <= ex2 and ey1 <= cy <= ey2
+
+    def _associate_weapons_to_persons():
+        """Return list of (weapon_label, person_index_or_None) associations."""
+        associations = []
+        for w_obj in weapon_objs:
+            w_lbl  = (w_obj.get('label') or w_obj.get('class') or 'weapon').strip()
+            w_bbox = w_obj.get('bbox')
+            matched_person = None
+            if w_bbox and person_objs:
+                cx, cy = _bbox_center(w_bbox)
+                for p_idx, p_obj in enumerate(person_objs):
+                    p_bbox = p_obj.get('bbox')
+                    if p_bbox and _point_in_expanded_bbox(cx, cy, p_bbox):
+                        matched_person = p_idx + 1   # 1-based
+                        break
+                if matched_person is None:
+                    # Fall back: nearest person by center distance
+                    def _dist(p_obj):
+                        pb = p_obj.get('bbox')
+                        if not pb:
+                            return float('inf')
+                        px, py = _bbox_center(pb)
+                        return ((px - cx) ** 2 + (py - cy) ** 2) ** 0.5
+                    nearest = min(person_objs, key=_dist)
+                    dist_px = _dist(nearest)
+                    if dist_px < 250:   # within ~250 pixels consider nearby
+                        matched_person = person_objs.index(nearest) + 1
+            associations.append((w_lbl, matched_person))
+        return associations
+
+    weapon_associations = _associate_weapons_to_persons() if weapon_objs else []
+
+    # Accident / distress indicators from detected labels
+    ACCIDENT_LABELS = {
+        'fire', 'smoke', 'flame', 'blood', 'ambulance', 'accident',
+        'fall', 'crash', 'explosion', 'collapsed'
+    }
+    accident_indicators = [
+        lbl for lbl in label_counts
+        if any(a in lbl for a in ACCIDENT_LABELS)
+    ]
+
+    # Build a human-readable object inventory string
+    def _object_inventory():
+        if not label_counts:
+            return "No objects detected in frame."
+        exclude = weapon_labels_set | {'person'}
+        parts = []
+        for label, count in label_counts.most_common(15):
+            if label in exclude:
+                continue
+            parts.append(f"{count}x {label}" if count > 1 else label)
+        return ", ".join(parts) if parts else "No additional objects."
+
+    def camera_summary():
+        """Rich structured scene description passed to Gemini as observation data."""
+        lines = []
+
+        # --- People & identity ---
+        if num_people == 0:
+            lines.append("PEOPLE: None visible in frame.")
+        elif num_people == 1:
+            lines.append("PEOPLE: 1 person in frame.")
+        else:
+            lines.append(f"PEOPLE: {num_people} people in frame.")
+
+        if identity and identity.lower() not in {'unknown', 'n/a', ''}:
+            lines.append(f"IDENTIFIED FACE: {identity} (recognised in database).")
+        elif threats.get('is_unknown_person'):
+            lines.append("IDENTIFIED FACE: Unknown person — not in the authorised database.")
+
+        if threats.get('has_mask'):
+            lines.append("FACE COVERING: Individual is wearing a mask or face covering.")
+
+        # --- Weapon detections with specifics ---
+        if weapon_associations:
+            for w_lbl, p_idx in weapon_associations:
+                if p_idx is not None:
+                    who = identity if (identity and identity.lower() not in {'unknown', 'n/a', ''}
+                                       and p_idx == 1 and num_people == 1) else f"Person {p_idx}"
+                    lines.append(f"WEAPON ALERT: {w_lbl} detected — {who} appears to be holding it.")
+                else:
+                    lines.append(f"WEAPON ALERT: {w_lbl} detected in the scene — no person directly associated.")
+        elif threats.get('has_weapon'):
+            raw = threats.get('weapons_detected') or suspicious
+            lines.append("WEAPON ALERT: " + (", ".join(str(w) for w in raw[:5]) if raw else "Unknown weapon type") + " detected.")
+        elif suspicious:
+            lines.append("SUSPICIOUS ITEMS: " + ", ".join(str(s) for s in suspicious[:5]))
+
+        # --- Accident / distress scene indicators ---
+        if accident_indicators:
+            lines.append("ACCIDENT/DISTRESS INDICATORS: " + ", ".join(accident_indicators) + " detected in frame.")
+
+        # --- All other visible objects (activity inference) ---
+        inv = _object_inventory()
+        lines.append(f"OTHER OBJECTS IN SCENE: {inv}")
+
+        # --- Deepfake ---
+        if deepfake.get('is_deepfake'):
+            conf = deepfake.get('confidence')
+            pct  = f" ({float(conf)*100:.0f}% confidence)" if conf is not None else ""
+            lines.append(f"DEEPFAKE ALERT{pct}: Synthetic or manipulated media detected.")
+
+        # --- Risk (background, not the headline) ---
+        try:
+            score_pct = f", score {float(overall_score)*100:.0f}%" if overall_score is not None else ""
+        except Exception:
+            score_pct = ""
+        lines.append(f"RISK LEVEL: {risk_level}{score_pct}")
+
+        if threat_cat and str(threat_cat).upper() not in {'NONE', 'NORMAL', ''}:
+            lines.append(f"THREAT CATEGORY: {threat_cat}")
+
+        return "\n".join(lines)
+
+    # ── RAG + Gemini response ─────────────────────────────────────────────────
+    effective_query = user_query or "Give me the current status."
+
+    # If camera is off and no real analysis data, don't pass a misleading scene summary to Gemini
+    has_real_analysis = bool(analysis.get('objects') or analysis.get('face_recognition') or analysis.get('risk_assessment'))
+    effective_camera_summary = camera_summary() if (live_active or has_real_analysis) else "CAMERA STATUS: Live CCTV is currently OFF — no feed is streaming. No scene data is available."
+
+    if rag_engine is not None and gemini_client is not None:
+        try:
+            # Refresh index if stale (every index_refresh_minutes)
+            if rag_engine.is_stale():
+                rag_engine.build_index(current_user['user_id'])
+            context_logs = rag_engine.retrieve(effective_query, k=rag_engine.top_k)
+            text = gemini_client.generate(
+                assistant_name,
+                effective_camera_summary,
+                effective_query,
+                context_logs,
+                ui_context=_build_ui_context(),
+                frame_base64=frame_b64,
+            )
+        except Exception as _llm_err:
+            print(f"[Gemini RAG] failed: {_llm_err}")
+            text = f"I'm monitoring the situation. {effective_camera_summary}"
+    else:
+        # Fallback — no API key or packages not installed
+        text = f"I'm online and monitoring. {effective_camera_summary}"
+
+    audio_base64 = None
+    mime = None
+    try:
+        # Primary: edge-tts (Microsoft neural voices — always works when online)
+        mp3_bytes = await _synthesize_edge_tts(text, assistant_voice)
+        if mp3_bytes and len(mp3_bytes) > 0:
+            audio_base64 = base64.b64encode(mp3_bytes).decode("utf-8")
+            mime = "audio/mpeg"
+        else:
+            # Fallback: pyttsx3 offline
+            loop = asyncio.get_running_loop()
+            wav_bytes = await loop.run_in_executor(
+                _tts_executor,
+                _synthesize_speech_wav_bytes_with_voice,
+                text,
+                assistant_voice,
+            )
+            if wav_bytes and len(wav_bytes) > 0:
+                audio_base64 = base64.b64encode(wav_bytes).decode("utf-8")
+                mime = "audio/wav"
+    except Exception as e:
+        print(f"[TTS] synthesis failed: {e}")
+        audio_base64 = None
+        mime = None
+
+    return {
+        "assistant": {
+            "name": assistant_name,
+        },
+        "jarvis": {
+            "text": text,
+            "audio_base64": audio_base64,
+            "mime": mime,
+            "action": jarvis_action,
+        }
+    }
+
+
+@app.get("/assistant/voices", tags=["Assistant"])
+async def assistant_list_voices(current_user: dict = Depends(get_current_user)):
+    """List installed offline TTS voices (pyttsx3/SAPI)."""
+    if pyttsx3 is None:
+        return {"voices": [], "available": False}
+
+    with _tts_lock:
+        engine = _get_tts_engine()
+        if engine is None:
+            return {"voices": [], "available": False}
+
+        try:
+            voices = engine.getProperty('voices') or []
+        except Exception:
+            voices = []
+
+    out = []
+    for v in voices:
+        try:
+            out.append({
+                "id": getattr(v, 'id', None),
+                "name": getattr(v, 'name', None),
+            })
+        except Exception:
+            continue
+
+    return {"voices": out, "available": True}
+
 
 @app.put("/user/telegram-settings", tags=["User"])
 async def update_telegram_settings(
@@ -567,6 +1188,33 @@ async def health_check():
     }
 
 
+@app.get("/db/status", tags=["System"])
+async def db_status():
+    """Return current MongoDB connection status."""
+    if pipeline is None or pipeline.mongodb_manager is None:
+        return {"connected": False, "detail": "MongoDB manager not initialised"}
+    mgr = pipeline.mongodb_manager
+    alive = mgr.ping()
+    return {
+        "connected": alive,
+        "detail": "Online" if alive else "Unreachable — will auto-retry every 30 s",
+    }
+
+
+@app.post("/db/reconnect", tags=["System"])
+async def db_reconnect(current_user: dict = Depends(get_current_user)):
+    """Force an immediate MongoDB reconnection attempt."""
+    if pipeline is None or pipeline.mongodb_manager is None:
+        raise HTTPException(status_code=503, detail="MongoDB manager not initialised")
+    success = pipeline.mongodb_manager.reconnect()
+    if success:
+        return {"connected": True, "detail": "Reconnected successfully"}
+    raise HTTPException(
+        status_code=503,
+        detail="Reconnection failed — Atlas may be unreachable. Check your network and Atlas IP whitelist."
+    )
+
+
 @app.get("/test-config", tags=["System"])
 async def test_config():
     """Test endpoint to check API configuration"""
@@ -581,6 +1229,7 @@ async def test_config():
 async def analyze_image(
     file: UploadFile = File(...),
     return_annotated: bool = Form(True),  # 🎯 DEFAULT TRUE - Always return visual analysis
+    camera_id: Optional[str] = Form(None),
     current_user: Optional[dict] = Depends(get_current_user_optional),
 ):
     """
@@ -622,6 +1271,7 @@ async def analyze_image(
                 image,
                 return_annotated=return_annotated,
                 user_id=user_id,
+                camera_id=camera_id,
             )
         finally:
             _analyze_semaphore.release()
@@ -759,6 +1409,70 @@ async def analyze_video(
         cap = cv2.VideoCapture(temp_path)
         fps = int(cap.get(cv2.CAP_PROP_FPS))
         cap.release()
+
+        # Deepfake (video-level) summary: aggregate per-frame deepfake results on frames with a detected face.
+        deepfake_summary = None
+        try:
+            threshold = float(getattr(getattr(pipeline, 'deepfake_detector', None), 'threshold', 0.5))
+            face_frames = []
+            for r in results:
+                fr = (r or {}).get('face_recognition') or {}
+                if fr.get('face_detected'):
+                    face_frames.append(r)
+
+            probs = []
+            suspect_frames = []
+            for r in face_frames:
+                frame_num = r.get('frame_number', 0)
+                ts = frame_num / fps if fps > 0 else 0
+                df = (r or {}).get('deepfake') or {}
+                prob = df.get('fake_probability')
+                if prob is None:
+                    continue
+                prob_f = float(prob)
+                probs.append(prob_f)
+                if prob_f > threshold:
+                    suspect_frames.append({
+                        'frame': frame_num,
+                        'timestamp': f"{ts:.2f}s",
+                        'fake_probability': round(prob_f, 4)
+                    })
+
+            if probs:
+                probs_sorted = sorted(probs)
+                p95_idx = int(0.95 * (len(probs_sorted) - 1))
+                p95 = probs_sorted[p95_idx]
+                mean_prob = sum(probs_sorted) / len(probs_sorted)
+                max_prob = probs_sorted[-1]
+                suspect_ratio = (len(suspect_frames) / len(face_frames)) if face_frames else 0.0
+
+                # Simple offline video decision rule: needs both a high percentile and a non-trivial fraction of suspect frames.
+                is_fake_video = (p95 > threshold and suspect_ratio >= 0.30)
+                deepfake_summary = {
+                    'label': 'FAKE' if is_fake_video else 'REAL',
+                    'threshold': round(threshold, 4),
+                    'frames_with_face': len(face_frames),
+                    'frames_suspect': len(suspect_frames),
+                    'suspect_ratio': round(suspect_ratio, 4),
+                    'fake_probability_mean': round(mean_prob, 4),
+                    'fake_probability_p95': round(p95, 4),
+                    'fake_probability_max': round(max_prob, 4),
+                    'suspect_frames': suspect_frames[:50],
+                }
+            else:
+                deepfake_summary = {
+                    'label': 'UNKNOWN',
+                    'threshold': round(threshold, 4),
+                    'frames_with_face': len(face_frames),
+                    'frames_suspect': 0,
+                    'suspect_ratio': 0.0,
+                    'message': 'No deepfake scores available (no faces detected or deepfake output missing).'
+                }
+        except Exception:
+            deepfake_summary = {
+                'label': 'UNKNOWN',
+                'message': 'Deepfake video summary failed to compute.'
+            }
         
         for result in results:
             frame_num = result.get('frame_number', 0)
@@ -803,11 +1517,9 @@ async def analyze_video(
             with open(output_video_path, 'rb') as f:
                 import base64
                 annotated_video_base64 = base64.b64encode(f.read()).decode('utf-8')
-            os.remove(output_video_path)
-        
-        # Clean up temp file
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+
+        # Note: Per project constraint, we do not delete temp files here.
+        # temp_path/output_video_path are left on disk.
         
         print(f"\n📊 Analysis Complete:")
         print(f"   Frames processed: {len(results)}")
@@ -819,6 +1531,7 @@ async def analyze_video(
             "num_frames_processed": len(results),
             "weapon_summary": weapon_summary,
             "weapon_detections": dict(weapon_detections),
+            "deepfake_summary": deepfake_summary,
             "results": results if not weapon_detection_only else [
                 {
                     'frame_number': r['frame_number'],
@@ -843,7 +1556,9 @@ async def analyze_video(
 @app.post("/face/add", tags=["Face Database"])
 async def add_face(
     name: str = Form(...),
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
+    camera_id: Optional[str] = Form(None),
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Add a new identity to the face recognition database.
@@ -1208,20 +1923,50 @@ async def get_statistics():
 # ===== Run Server =====
 if __name__ == "__main__":
     import uvicorn
-    
+    import socket
+    import subprocess
+
+    TARGET_PORT = int(os.getenv("VG_API_PORT", "8000"))
+
+    # Kill anything already holding the target port so we always bind the same port
+    def _kill_port(port: int):
+        try:
+            result = subprocess.run(
+                f'netstat -ano | findstr :{port}',
+                shell=True, capture_output=True, text=True
+            )
+            for line in result.stdout.strip().splitlines():
+                parts = line.split()
+                if f':{port}' in parts[1] and parts[3] == 'LISTENING':
+                    pid = parts[4]
+                    subprocess.run(f'taskkill /F /PID {pid}', shell=True, capture_output=True)
+                    print(f"🔪 Killed old process on port {port} (PID {pid})")
+        except Exception:
+            pass
+
+    _kill_port(TARGET_PORT)
+
     print("\n" + "=" * 60)
     print("🚀 Starting VisionGuard AI API Server")
     print("=" * 60)
-    print("\n📍 API will be available at: http://localhost:8000")
-    print("📖 API Documentation: http://localhost:8000/docs")
-    print("📊 Alternative Docs: http://localhost:8000/redoc\n")
-    
+    print(f"\n📍 API will be available at: http://localhost:{TARGET_PORT}")
+    print(f"📖 API Documentation: http://localhost:{TARGET_PORT}/docs")
+    print(f"📊 Alternative Docs: http://localhost:{TARGET_PORT}/redoc\n")
+
     reload_enabled = os.getenv("VG_API_RELOAD", "0") == "1"
 
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=reload_enabled,
-        log_level="info"
-    )
+    if reload_enabled:
+        uvicorn.run(
+            "api.main:app",
+            host="0.0.0.0",
+            port=TARGET_PORT,
+            reload=True,
+            log_level="info",
+        )
+    else:
+        uvicorn.run(
+            app,
+            host="0.0.0.0",
+            port=TARGET_PORT,
+            log_level="info",
+        )

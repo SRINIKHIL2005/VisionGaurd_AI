@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import { motion } from 'framer-motion'
-import { Camera, Video, Play, Square, AlertCircle, Activity, Target, Eye, MessageCircle, Settings } from 'lucide-react'
+import { Camera, Video, Play, Square, AlertCircle, Activity, Target, MessageCircle, Settings, Mic } from 'lucide-react'
 import Webcam from 'react-webcam'
 import authService from '../services/authService'
 import { Link } from 'react-router-dom'
@@ -14,10 +14,17 @@ export default function LiveCCTV() {
   const [frameSkip, setFrameSkip] = useState(2)
   const [isAnalyzing, setIsAnalyzing] = useState(false)
   const webcamRef = useRef(null)
+  const overlayCanvasRef = useRef(null)
+  const feedContainerRef = useRef(null)
   const intervalRef = useRef(null)
+  const isMonitoringRef = useRef(false)  // stable ref for event handlers
 
   const startMonitoring = () => {
+    if (isMonitoringRef.current) return  // already running
+    isMonitoringRef.current = true
     setIsMonitoring(true)
+    // Inform Jarvis that live CCTV is now active
+    window.dispatchEvent(new CustomEvent('visionguard:page-state-update', { detail: { live_cctv_active: true } }))
     
     // Process frames periodically
     intervalRef.current = setInterval(async () => {
@@ -39,13 +46,34 @@ export default function LiveCCTV() {
   }
 
   const stopMonitoring = () => {
+    isMonitoringRef.current = false
     setIsMonitoring(false)
+    // Inform Jarvis that live CCTV is now inactive
+    window.dispatchEvent(new CustomEvent('visionguard:page-state-update', { detail: { live_cctv_active: false } }))
     if (intervalRef.current) {
       clearInterval(intervalRef.current)
     }
     setResult(null)
     setAnnotatedFrame(null)
   }
+
+  // Listen for Jarvis voice commands to start/stop live monitoring
+  // Also broadcast initial state on mount so JarvisAssistant stays in sync
+  useEffect(() => {
+    // Broadcast current state immediately so Jarvis knows if feed is on/off
+    window.dispatchEvent(new CustomEvent('visionguard:page-state-update', { detail: { live_cctv_active: isMonitoringRef.current } }))
+
+    const onJarvisStart = () => { if (!isMonitoringRef.current) startMonitoring() }
+    const onJarvisStop  = () => { if (isMonitoringRef.current)  stopMonitoring()  }
+    window.addEventListener('visionguard:jarvis-start-live', onJarvisStart)
+    window.addEventListener('visionguard:jarvis-stop-live',  onJarvisStop)
+    return () => {
+      window.removeEventListener('visionguard:jarvis-start-live', onJarvisStart)
+      window.removeEventListener('visionguard:jarvis-stop-live',  onJarvisStop)
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
 
   const analyzeFrame = async (imageBase64) => {
     setIsAnalyzing(true)
@@ -55,7 +83,8 @@ export default function LiveCCTV() {
       const blob = await response.blob()
       
       const formData = new FormData()
-      formData.append('file', blob, 'frame.jpg')
+        formData.append("file", blob, "frame.jpg");
+        formData.append("camera_id", "livecctv");
       formData.append('return_annotated', 'true')
 
       const axios = authService.getAuthAxios()
@@ -79,12 +108,73 @@ export default function LiveCCTV() {
     }
   }
 
+  // --- Draw tracking overlay on canvas whenever result changes ---
+  useEffect(() => {
+    const canvas = overlayCanvasRef.current
+    const container = feedContainerRef.current
+    if (!canvas || !container) return
+
+    const ctx = canvas.getContext('2d')
+    // Match canvas size to displayed video container
+    const rect = container.getBoundingClientRect()
+    canvas.width = rect.width
+    canvas.height = rect.height
+    ctx.clearRect(0, 0, canvas.width, canvas.height)
+
+    if (!result || !result.objects || !isMonitoring) return
+
+    // We need the original image dimensions to scale bboxes.
+    // The backend works on the raw webcam frame (usually 640x480).
+    const srcW = 640
+    const srcH = 480
+    const scaleX = canvas.width / srcW
+    const scaleY = canvas.height / srcH
+
+    result.objects.forEach((obj) => {
+      if (!obj.bbox || obj.bbox.length < 4) return
+      const [x1, y1, x2, y2] = obj.bbox
+      const sx = x1 * scaleX
+      const sy = y1 * scaleY
+      const sw = (x2 - x1) * scaleX
+      const sh = (y2 - y1) * scaleY
+
+      const isPerson = (obj.label || '').toLowerCase() === 'person'
+      const isSuspicious = (result.suspicious_objects || []).includes(obj.label)
+
+      // Box color
+      ctx.strokeStyle = isSuspicious ? '#ef4444' : isPerson ? '#3b82f6' : '#22c55e'
+      ctx.lineWidth = 2
+      ctx.strokeRect(sx, sy, sw, sh)
+
+      // Label text
+      let label = obj.label || 'object'
+      if (obj.track_id != null) label = `#${obj.track_id} ${label}`
+      label += ` ${(obj.confidence * 100).toFixed(0)}%`
+
+      ctx.font = 'bold 13px Inter, system-ui, sans-serif'
+      const tm = ctx.measureText(label)
+      const pad = 3
+      const lblH = 18
+      ctx.fillStyle = isSuspicious ? '#ef4444' : isPerson ? '#3b82f6' : '#22c55e'
+      ctx.fillRect(sx, sy - lblH - pad, tm.width + pad * 2, lblH + pad)
+      ctx.fillStyle = '#fff'
+      ctx.fillText(label, sx + pad, sy - pad - 2)
+    })
+  }, [result, isMonitoring])
+
+  // Broadcast latest analysis to the global JarvisAssistant
+  useEffect(() => {
+    if (!result) return
+    try {
+      window.dispatchEvent(new CustomEvent('visionguard:live-analysis', { detail: result }))
+    } catch {}
+  }, [result])
+
   useEffect(() => {
     return () => {
-      if (intervalRef.current) {
-        clearInterval(intervalRef.current)
-      }
+      if (intervalRef.current) clearInterval(intervalRef.current)
     }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   return (
@@ -143,7 +233,7 @@ export default function LiveCCTV() {
               </div>
             </div>
 
-            <div className="bg-black rounded-xl overflow-hidden aspect-video">
+            <div className="bg-black rounded-xl overflow-hidden aspect-video relative" ref={feedContainerRef}>
               {isMonitoring ? (
                 annotatedFrame ? (
                   <img src={annotatedFrame} alt="Annotated Feed" className="w-full h-full object-cover" />
@@ -164,6 +254,12 @@ export default function LiveCCTV() {
                   </div>
                 </div>
               )}
+              {/* Tracking / bbox overlay */}
+              <canvas
+                ref={overlayCanvasRef}
+                className="absolute inset-0 w-full h-full pointer-events-none"
+                style={{ zIndex: 10 }}
+              />
             </div>
           </div>
 
@@ -195,7 +291,12 @@ export default function LiveCCTV() {
                             <span className={`font-semibold text-lg ${
                               isSuspicious ? 'text-red-900' : 'text-gray-900'
                             }`}>
-                              {obj.label || obj.class || 'Unknown'}
+                              {obj.track_id != null && (
+                              <span className="mr-1 px-1.5 py-0.5 bg-blue-100 text-blue-700 text-xs rounded font-mono">
+                                #{obj.track_id}
+                              </span>
+                            )}
+                            {obj.label || obj.class || 'Unknown'}
                             </span>
                             {isSuspicious && (
                               <span className="ml-2 px-2 py-0.5 bg-red-600 text-white text-xs rounded-full font-bold">
@@ -284,6 +385,22 @@ export default function LiveCCTV() {
                 Stop
               </button>
             </div>
+
+            {/* Assistant Call — opens the global Siri-style overlay */}
+            <div className="mt-4 pt-4 border-t border-gray-100">
+              <button
+                onClick={() => {
+                  try { window.dispatchEvent(new CustomEvent('visionguard:jarvis-open')) } catch {}
+                }}
+                className="w-full bg-gradient-to-r from-indigo-600 via-purple-600 to-pink-600 text-white py-3 rounded-xl font-semibold flex items-center justify-center hover:shadow-lg hover:shadow-purple-500/30 transition-all gap-2"
+              >
+                <Mic className="w-5 h-5" />
+                Talk to Jarvis
+              </button>
+              <p className="text-xs text-gray-500 mt-2 text-center">
+                Or say <span className="font-semibold text-gray-700">"Hey Jarvis"</span> anytime
+              </p>
+            </div>
           </div>
         </div>
 
@@ -352,6 +469,15 @@ export default function LiveCCTV() {
                       {result.suspicious_objects.length}
                     </span>
                   </div>
+
+                  {result.tracking && result.tracking.tracks && (
+                    <div className="flex items-center justify-between">
+                      <span className="text-sm text-gray-700">Tracked IDs</span>
+                      <span className="text-sm font-semibold text-blue-600">
+                        {result.tracking.tracks.filter(t => t.missed === 0).length}
+                      </span>
+                    </div>
+                  )}
                 </div>
               </div>
 
@@ -407,6 +533,7 @@ export default function LiveCCTV() {
           )}
         </div>
       </div>
+
     </div>
   )
 }

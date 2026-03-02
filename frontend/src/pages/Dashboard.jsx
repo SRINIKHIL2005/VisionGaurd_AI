@@ -12,11 +12,11 @@ export default function Dashboard() {
     const fetchData = async () => {
       try {
         // Fetch system health
-        const healthRes = await axios.get('http://localhost:8000/health')
+        const healthRes = await axios.get('/health')
         setSystemHealth(healthRes.data)
 
         // Fetch face database count
-        const facesRes = await axios.get('http://localhost:8000/face/list')
+        const facesRes = await axios.get('/face/list')
         setFaceCount(facesRes.data.identities.length)
       } catch (error) {
         console.error('Failed to fetch dashboard data:', error)

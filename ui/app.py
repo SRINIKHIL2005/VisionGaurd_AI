@@ -369,8 +369,8 @@ def main():
                         display_results(result, show_expanders=False)
                 
                 # Clean up
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
+                # Note: Per project constraint, we do not delete temp files here.
+                # temp_path is left on disk.
     
     # ===== LIVE CAMERA (CCTV) MODE =====
     elif mode == "📹 Live Camera (CCTV)":

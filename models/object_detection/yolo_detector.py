@@ -185,7 +185,13 @@ class YOLODetector:
     def detect(
         self,
         image: Union[np.ndarray, Image.Image],
-        return_image: bool = False
+        return_image: bool = False,
+        *,
+        frame_index: Optional[int] = None,
+        weapon_mode: str = "full",
+        weapon_every_n_frames: int = 1,
+        weapon_require_person: bool = True,
+        weapon_roi_padding: float = 0.15
     ) -> Dict:
         """
         Detect objects in a single image.
@@ -224,6 +230,7 @@ class YOLODetector:
         # Parse results
         detected_objects = []
         suspicious_items = []
+        person_bboxes: List[List[int]] = []
         
         for result in results:
             boxes = result.boxes
@@ -239,48 +246,106 @@ class YOLODetector:
                     'label': label,
                     'confidence': round(conf, 4),
                     'bbox': [int(x1), int(y1), int(x2), int(y2)],
-                    'class_id': cls_id
+                    'class_id': cls_id,
+                    'source': 'general_model'
                 }
                 
                 detected_objects.append(obj_dict)
+
+                if label.lower() == 'person':
+                    person_bboxes.append(obj_dict['bbox'])
                 
                 # Check if suspicious
                 if label.lower() in [s.lower() for s in self.suspicious_objects]:
                     suspicious_items.append(obj_dict)
         
-        # Also run weapon model if available
-        if self.weapon_model is not None:
-            weapon_results = self.weapon_model.predict(
-                image_bgr,
-                conf=self.weapon_confidence,  # Use configurable weapon threshold (default 0.65)
-                iou=self.iou_threshold,
-                imgsz=self.imgsz,
-                max_det=self.max_det,
-                device=self.device,
-                verbose=False
-            )
+        weapon_results = []
+        run_weapon = (
+            self.weapon_model is not None and
+            weapon_every_n_frames >= 1 and
+            (frame_index is None or ((frame_index - 1) % weapon_every_n_frames) == 0) and
+            (not weapon_require_person or len(person_bboxes) > 0)
+        )
+
+        # Also run weapon model if available (optionally gated)
+        if run_weapon:
+            if weapon_mode not in ("full", "roi"):
+                weapon_mode = "full"
+
+            if weapon_mode == "roi" and len(person_bboxes) > 0:
+                h, w = image_bgr.shape[:2]
+                for bbox in person_bboxes:
+                    x1, y1, x2, y2 = bbox
+                    bw, bh = max(0, x2 - x1), max(0, y2 - y1)
+                    pad = int(weapon_roi_padding * max(bw, bh))
+                    rx1 = max(0, x1 - pad)
+                    ry1 = max(0, y1 - pad)
+                    rx2 = min(w, x2 + pad)
+                    ry2 = min(h, y2 + pad)
+                    if rx2 <= rx1 or ry2 <= ry1:
+                        continue
+                    roi = image_bgr[ry1:ry2, rx1:rx2]
+                    roi_results = self.weapon_model.predict(
+                        roi,
+                        conf=self.weapon_confidence,
+                        iou=self.iou_threshold,
+                        imgsz=self.imgsz,
+                        max_det=self.max_det,
+                        device=self.device,
+                        verbose=False
+                    )
+                    weapon_results.extend(roi_results)
+
+                    for result in roi_results:
+                        boxes = result.boxes
+                        for box in boxes:
+                            wx1, wy1, wx2, wy2 = box.xyxy[0].cpu().numpy()
+                            conf = float(box.conf[0])
+                            cls_id = int(box.cls[0])
+                            label = self.weapon_model.names[cls_id]
+
+                            obj_dict = {
+                                'label': label,
+                                'confidence': round(conf, 4),
+                                'bbox': [int(wx1) + rx1, int(wy1) + ry1, int(wx2) + rx1, int(wy2) + ry1],
+                                'class_id': cls_id,
+                                'source': 'weapon_model',
+                                'is_weapon': True
+                            }
+                            detected_objects.append(obj_dict)
+                            suspicious_items.append(obj_dict)
+            else:
+                weapon_results = self.weapon_model.predict(
+                    image_bgr,
+                    conf=self.weapon_confidence,  # Use configurable weapon threshold (default 0.65)
+                    iou=self.iou_threshold,
+                    imgsz=self.imgsz,
+                    max_det=self.max_det,
+                    device=self.device,
+                    verbose=False
+                )
             
-            for result in weapon_results:
-                boxes = result.boxes
-                
-                for box in boxes:
-                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                    conf = float(box.conf[0])
-                    cls_id = int(box.cls[0])
-                    label = self.weapon_model.names[cls_id]
+                for result in weapon_results:
+                    boxes = result.boxes
                     
-                    # Mark as weapon detection (keep original label for matching)
-                    obj_dict = {
-                        'label': label,  # Keep original: Grenade, Knife, Pistol, Rifle
-                        'confidence': round(conf, 4),
-                        'bbox': [int(x1), int(y1), int(x2), int(y2)],
-                        'class_id': cls_id,
-                        'source': 'weapon_model',
-                        'is_weapon': True  # Flag for easy identification
-                    }
-                    
-                    detected_objects.append(obj_dict)
-                    suspicious_items.append(obj_dict)  # All weapon detections are suspicious
+                    for box in boxes:
+                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                        conf = float(box.conf[0])
+                        cls_id = int(box.cls[0])
+                        label = self.weapon_model.names[cls_id]
+                        
+                        # Mark as weapon detection (keep original label for matching)
+                        obj_dict = {
+                            'label': label,  # Keep original: Grenade, Knife, Pistol, Rifle
+                            'confidence': round(conf, 4),
+                            'bbox': [int(x1), int(y1), int(x2), int(y2)],
+                            'class_id': cls_id,
+                            'source': 'weapon_model',
+                            'is_weapon': True  # Flag for easy identification
+                        }
+                        
+                        detected_objects.append(obj_dict)
+                        suspicious_items.append(obj_dict)  # All weapon detections are suspicious
         
         # Generate annotated image if requested
         annotated_image = None
@@ -288,10 +353,12 @@ class YOLODetector:
             annotated_image = results[0].plot()
             # If weapon model detected something, add those annotations too
             if self.weapon_model is not None and len(weapon_results) > 0:
-                weapon_annotated = weapon_results[0].plot()
-                # Overlay weapon detections on standard image
-                # Simple overlay - in production you'd want better visualization
-                annotated_image = cv2.addWeighted(annotated_image, 0.7, weapon_annotated, 0.3, 0)
+                try:
+                    weapon_annotated = weapon_results[0].plot()
+                    # Overlay weapon detections on standard image
+                    annotated_image = cv2.addWeighted(annotated_image, 0.7, weapon_annotated, 0.3, 0)
+                except Exception:
+                    pass
         
         return {
             'objects': detected_objects,

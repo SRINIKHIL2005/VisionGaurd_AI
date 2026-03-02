@@ -41,7 +41,7 @@ export default function VideoAnalysis() {
     formData.append('frame_skip', frameSkip.toString())
 
     try {
-      const response = await axios.post('http://localhost:8000/analyze/video', formData, {
+      const response = await axios.post('/analyze/video', formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
       })
       setResults(response.data)

@@ -32,6 +32,19 @@ models:
     weapon_model: "./Learning/weapon_training/weapon_detector_v1/weights/best.pt"  # Custom trained weapon detector
     weapon_confidence: 0.50  # Weapon model threshold (lower = more detections)
 
+    # Weapon inference optimization (Option 2: conditional + ROI)
+    weapon_inference:
+      mode: "roi"           # "roi" runs weapon model on person crops; "full" runs on full frame
+      every_n_frames: 3      # run weapon model every N frames (1 = every frame)
+      require_person: true   # skip weapon model if no person detected
+      roi_padding: 0.15      # extra padding around person ROI
+
+    # Lightweight tracking (stable IDs for persons in Live CCTV)
+    tracking:
+      enabled: true
+      iou_threshold: 0.3
+      max_missed: 10
+
 
 # ===== Risk Assessment =====
 risk_assessment:
