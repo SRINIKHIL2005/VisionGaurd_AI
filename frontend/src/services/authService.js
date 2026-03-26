@@ -218,7 +218,11 @@ authAxios.interceptors.response.use(
         originalRequest.headers.Authorization = `Bearer ${refreshRes.data.access_token}`;
         return authAxios(originalRequest);
       } catch (refreshError) {
-        authService.logout();
+        const status = refreshError.response?.status;
+        // Only hard-logout on definitive auth failures (4xx), not transient server/network errors
+        if (status && status >= 400 && status < 500) {
+          authService.logout();
+        }
         return Promise.reject(refreshError);
       }
     }

@@ -2,6 +2,7 @@
   "name": "visionguard-frontend",
   "version": "2.0.0",
   "private": true,
+  "type": "module",
   "description": "VisionGuard AI - Advanced Security Frontend",
   "dependencies": {
     "axios": "^1.6.2",

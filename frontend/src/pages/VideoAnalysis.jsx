@@ -3,8 +3,8 @@ import { motion } from 'framer-motion'
 import { Video, Upload, Loader, AlertCircle, BarChart3, Clock } from 'lucide-react'
 import { useDropzone } from 'react-dropzone'
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts'
-import axios from 'axios'
 import RiskBadge from '../components/RiskBadge'
+import authService from '../services/authService'
 
 export default function VideoAnalysis() {
   const [video, setVideo] = useState(null)
@@ -41,6 +41,7 @@ export default function VideoAnalysis() {
     formData.append('frame_skip', frameSkip.toString())
 
     try {
+      const axios = authService.getAuthAxios()
       const response = await axios.post('/analyze/video', formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
       })
@@ -74,10 +75,10 @@ export default function VideoAnalysis() {
         initial={{ opacity: 0, y: -20 }}
         animate={{ opacity: 1, y: 0 }}
       >
-        <h1 className="text-4xl font-bold bg-gradient-primary bg-clip-text text-transparent mb-2">
+        <h1 className="text-4xl font-bold bg-gradient-to-r from-blue-400 to-cyan-400 bg-clip-text text-transparent mb-2">
           Video Analysis
         </h1>
-        <p className="text-gray-600">Upload videos for frame-by-frame security analysis</p>
+        <p className="text-slate-400">Upload videos for frame-by-frame security analysis</p>
       </motion.div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
@@ -87,26 +88,26 @@ export default function VideoAnalysis() {
             {...getRootProps()}
             className={`border-3 border-dashed rounded-2xl p-12 text-center cursor-pointer transition-all ${
               isDragActive
-                ? 'border-primary-500 bg-primary-50 scale-105'
-                : 'border-gray-300 hover:border-primary-400 hover:bg-gray-50'
-            }`}
+                ? 'border-blue-500 bg-blue-900/20 scale-105'
+                : 'border-slate-700/50 hover:border-blue-500 hover:bg-slate-800/30'
+          }`}
           >
             <input {...getInputProps()} />
-            <Video className="w-16 h-16 text-gray-400 mx-auto mb-4" />
-            <p className="text-lg font-semibold text-gray-700 mb-2">
+            <Video className="w-16 h-16 text-slate-500 mx-auto mb-4" />
+            <p className="text-lg font-semibold text-slate-300 mb-2">
               {isDragActive ? 'Drop video here' : 'Drag & drop video'}
             </p>
-            <p className="text-sm text-gray-500">or click to browse</p>
-            <p className="text-xs text-gray-400 mt-2">Supports: MP4, AVI, MOV</p>
+            <p className="text-sm text-slate-400">or click to browse</p>
+            <p className="text-xs text-slate-500 mt-2">Supports: MP4, AVI, MOV</p>
           </div>
 
           {videoPreview && (
-            <div className="bg-white rounded-2xl shadow-lg p-6 border border-gray-100">
-              <h3 className="text-lg font-semibold text-gray-900 mb-4">Video Preview</h3>
+            <div className="bg-[#060c18] rounded-2xl border border-slate-800/60 p-6">
+              <h3 className="text-lg font-semibold text-white mb-4">Video Preview</h3>
               <video src={videoPreview} controls className="w-full rounded-xl shadow-md mb-4" />
               
               <div className="mb-4">
-                <label className="block text-sm font-medium text-gray-700 mb-2">
+                <label className="block text-sm font-medium text-slate-300 mb-2">
                   Frame Skip (process every {frameSkip} frames)
                 </label>
                 <input
@@ -117,7 +118,7 @@ export default function VideoAnalysis() {
                   onChange={(e) => setFrameSkip(parseInt(e.target.value))}
                   className="w-full"
                 />
-                <div className="flex justify-between text-xs text-gray-500 mt-1">
+                <div className="flex justify-between text-xs text-slate-500 mt-1">
                   <span>Detailed (1)</span>
                   <span>Fast (30)</span>
                 </div>
@@ -126,7 +127,7 @@ export default function VideoAnalysis() {
               <button
                 onClick={analyzeVideo}
                 disabled={analyzing}
-                className="w-full bg-gradient-primary text-white py-4 rounded-xl font-semibold text-lg shadow-lg hover:shadow-xl transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center"
+                className="w-full bg-blue-600 hover:bg-blue-500 text-white py-4 rounded-xl font-semibold text-lg shadow-lg hover:shadow-xl transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center"
               >
                 {analyzing ? (
                   <>
@@ -147,12 +148,12 @@ export default function VideoAnalysis() {
         {/* Results Section */}
         <div className="space-y-6">
           {error && (
-            <div className="bg-red-50 border-2 border-red-200 rounded-2xl p-6">
+            <div className="bg-red-900/20 border border-red-500/30 rounded-2xl p-6">
               <div className="flex items-start space-x-3">
-                <AlertCircle className="w-6 h-6 text-red-600 flex-shrink-0" />
+                <AlertCircle className="w-6 h-6 text-red-400 flex-shrink-0" />
                 <div>
-                  <h3 className="text-red-900 font-semibold mb-1">Analysis Failed</h3>
-                  <p className="text-red-700 text-sm">{error}</p>
+                  <h3 className="text-red-300 font-semibold mb-1">Analysis Failed</h3>
+                  <p className="text-red-400 text-sm">{error}</p>
                 </div>
               </div>
             </div>
@@ -162,34 +163,34 @@ export default function VideoAnalysis() {
             <>
               {/* Statistics */}
               <div className="grid grid-cols-2 gap-4">
-                <div className="bg-white rounded-2xl shadow-lg p-6 text-center border border-gray-100">
-                  <Clock className="w-8 h-8 text-blue-600 mx-auto mb-2" />
-                  <p className="text-3xl font-bold text-gray-900">{stats.totalFrames}</p>
-                  <p className="text-sm text-gray-600 mt-1">Frames Processed</p>
+                <div className="bg-[#060c18] rounded-2xl border border-slate-800/60 p-6 text-center">
+                  <Clock className="w-8 h-8 text-blue-400 mx-auto mb-2" />
+                  <p className="text-3xl font-bold text-white">{stats.totalFrames}</p>
+                  <p className="text-sm text-slate-400 mt-1">Frames Processed</p>
                 </div>
                 
-                <div className="bg-white rounded-2xl shadow-lg p-6 text-center border border-gray-100">
-                  <AlertCircle className="w-8 h-8 text-red-600 mx-auto mb-2" />
-                  <p className="text-3xl font-bold text-red-600">{stats.highRisk}</p>
-                  <p className="text-sm text-gray-600 mt-1">High Risk Frames</p>
+                <div className="bg-[#060c18] rounded-2xl border border-slate-800/60 p-6 text-center">
+                  <AlertCircle className="w-8 h-8 text-red-500 mx-auto mb-2" />
+                  <p className="text-3xl font-bold text-red-400">{stats.highRisk}</p>
+                  <p className="text-sm text-slate-400 mt-1">High Risk Frames</p>
                 </div>
                 
-                <div className="bg-white rounded-2xl shadow-lg p-6 text-center border border-gray-100">
-                  <Video className="w-8 h-8 text-purple-600 mx-auto mb-2" />
-                  <p className="text-3xl font-bold text-purple-600">{stats.deepfakes}</p>
-                  <p className="text-sm text-gray-600 mt-1">Deepfake Frames</p>
+                <div className="bg-[#060c18] rounded-2xl border border-slate-800/60 p-6 text-center">
+                  <Video className="w-8 h-8 text-purple-400 mx-auto mb-2" />
+                  <p className="text-3xl font-bold text-purple-400">{stats.deepfakes}</p>
+                  <p className="text-sm text-slate-400 mt-1">Deepfake Frames</p>
                 </div>
                 
-                <div className="bg-white rounded-2xl shadow-lg p-6 text-center border border-gray-100">
-                  <BarChart3 className="w-8 h-8 text-green-600 mx-auto mb-2" />
-                  <p className="text-3xl font-bold text-gray-900">{stats.avgRisk}%</p>
-                  <p className="text-sm text-gray-600 mt-1">Avg Risk Score</p>
+                <div className="bg-[#060c18] rounded-2xl border border-slate-800/60 p-6 text-center">
+                  <BarChart3 className="w-8 h-8 text-green-400 mx-auto mb-2" />
+                  <p className="text-3xl font-bold text-white">{stats.avgRisk}%</p>
+                  <p className="text-sm text-slate-400 mt-1">Avg Risk Score</p>
                 </div>
               </div>
 
               {/* Risk Timeline Chart */}
-              <div className="bg-white rounded-2xl shadow-lg p-6 border border-gray-100">
-                <h3 className="text-lg font-semibold text-gray-900 mb-4">Risk Timeline</h3>
+              <div className="bg-[#060c18] rounded-2xl border border-slate-800/60 p-6">
+                <h3 className="text-lg font-semibold text-white mb-4">Risk Timeline</h3>
                 <ResponsiveContainer width="100%" height={250}>
                   <LineChart data={chartData}>
                     <CartesianGrid strokeDasharray="3 3" />
@@ -202,23 +203,23 @@ export default function VideoAnalysis() {
               </div>
 
               {/* Frame Results */}
-              <div className="bg-white rounded-2xl shadow-lg p-6 border border-gray-100 max-h-96 overflow-y-auto">
-                <h3 className="text-lg font-semibold text-gray-900 mb-4">Frame Analysis</h3>
+              <div className="bg-[#060c18] rounded-2xl border border-slate-800/60 p-6 max-h-96 overflow-y-auto">
+                <h3 className="text-lg font-semibold text-white mb-4">Frame Analysis</h3>
                 <div className="space-y-3">
                   {results.results.filter(r => ['HIGH', 'CRITICAL'].includes(r.risk_assessment.risk_level)).map((result, idx) => (
-                    <div key={idx} className="p-4 bg-gradient-to-r from-red-50 to-pink-50 rounded-xl border-l-4 border-red-500">
+                    <div key={idx} className="p-4 bg-red-900/20 rounded-xl border-l-4 border-red-500">
                       <div className="flex items-center justify-between mb-2">
-                        <span className="font-bold text-gray-900">Frame #{result.frame_number || idx}</span>
+                        <span className="font-bold text-white">Frame #{result.frame_number || idx}</span>
                         <span className={`px-3 py-1 rounded-full text-xs font-bold ${
                           result.risk_assessment.risk_level === 'CRITICAL' ? 'bg-red-600 text-white' : 'bg-orange-500 text-white'
                         }`}>
                           {result.risk_assessment.risk_level}
                         </span>
                       </div>
-                      <p className="text-sm text-gray-700">{result.summary}</p>
+                      <p className="text-sm text-slate-300">{result.summary}</p>
                       <div className="mt-2 flex flex-wrap gap-2">
                         {result.risk_assessment.reasons.map((reason, ridx) => (
-                          <span key={ridx} className="text-xs bg-white px-2 py-1 rounded-full text-gray-700">
+                          <span key={ridx} className="text-xs bg-slate-800/60 px-2 py-1 rounded-full text-slate-300">
                             {reason}
                           </span>
                         ))}

@@ -63,61 +63,80 @@ class MongoDBManager:
     def db(self, value):
         self._db = value
 
-    def _build_client(self) -> MongoClient:
-        """Build a MongoClient with Atlas-friendly settings, trying certifi first."""
+    def _clean_uri(self) -> str:
+        """Strip TLS/SSL params from URI so kwargs are the sole source of truth."""
+        import re
+        uri = re.sub(r'[&?]tls(?:Allow\w+|Insecure|CAFile|CertificateKey(?:File|Password)?|[^=&]*)=[^&]*', '', self.connection_string)
+        uri = re.sub(r'[&?]ssl(?:[^=&]*)=[^&]*', '', uri)
+        uri = re.sub(r'[?&]$', '', uri)
+        return uri
+
+    def _build_client(self, allow_insecure_tls: bool = False) -> MongoClient:
+        """Build a MongoClient.  NOTE: MongoClient is lazy — this never raises."""
+        base = dict(
+            serverSelectionTimeoutMS=self._SERVER_SEL_TIMEOUT_MS,
+            connectTimeoutMS=self._CONNECT_TIMEOUT_MS,
+            socketTimeoutMS=self._SOCKET_TIMEOUT_MS,
+            retryWrites=True,
+            retryReads=True,
+            tls=True,
+        )
+        if allow_insecure_tls:
+            # Bypass all cert / hostname validation (matches original URL intent)
+            return MongoClient(self._clean_uri(), **base,
+                               tlsAllowInvalidCertificates=True,
+                               tlsAllowInvalidHostnames=True)
+        # Strict path: use certifi CA bundle when available
         try:
             import certifi
-            return MongoClient(
-                self.connection_string,
-                serverSelectionTimeoutMS=self._SERVER_SEL_TIMEOUT_MS,
-                connectTimeoutMS=self._CONNECT_TIMEOUT_MS,
-                socketTimeoutMS=self._SOCKET_TIMEOUT_MS,
-                retryWrites=True,
-                retryReads=True,
-                tls=True,
-                tlsCAFile=certifi.where(),
-                tlsAllowInvalidCertificates=False,
-                tlsAllowInvalidHostnames=False,
-            )
-        except Exception:
-            # Fallback without strict cert check (Python 3.13 compat)
-            return MongoClient(
-                self.connection_string,
-                serverSelectionTimeoutMS=self._SERVER_SEL_TIMEOUT_MS,
-                connectTimeoutMS=self._CONNECT_TIMEOUT_MS,
-                socketTimeoutMS=self._SOCKET_TIMEOUT_MS,
-                retryWrites=True,
-                retryReads=True,
-                tls=True,
-                tlsInsecure=True,
-            )
+            return MongoClient(self._clean_uri(), **base, tlsCAFile=certifi.where())
+        except ImportError:
+            return MongoClient(self._clean_uri(), **base)
 
     def _connect(self):
         """
         Attempt to establish a MongoDB connection.
         Never raises — sets self.is_connected accordingly.
+        Tries strict TLS (certifi) first, then falls back to
+        tlsAllowInvalidCertificates=True if the SSL handshake fails.
         """
         with self._connect_lock:
             self._last_attempt = time.monotonic()
-            try:
-                if self.client:
-                    try:
-                        self.client.close()
-                    except Exception:
-                        pass
+            if self.client:
+                try:
+                    self.client.close()
+                except Exception:
+                    pass
 
-                self.client = self._build_client()
-                self.client.admin.command('ping')
-                self._db = self.client[self.database_name]
-                self._setup_collections()
-                self.is_connected = True
-                print(f"✅ Connected to MongoDB: {self.database_name}")
-            except Exception as e:
-                self.is_connected = False
-                self._db = None
-                # Truncate the huge Atlas error to one readable line
-                short = str(e).split(',')[0].strip()
-                print(f"⚠️  MongoDB unavailable (will retry in {self._RETRY_INTERVAL}s): {short}")
+            last_exc = None
+            for allow_insecure in (False, True):
+                client = None
+                try:
+                    client = self._build_client(allow_insecure_tls=allow_insecure)
+                    # ping() is where the actual TCP + TLS handshake happens (MongoClient is lazy)
+                    client.admin.command('ping')
+                    self.client = client
+                    self._db = self.client[self.database_name]
+                    self._setup_collections()
+                    self.is_connected = True
+                    print(f"✅ Connected to MongoDB: {self.database_name}")
+                    return
+                except Exception as e:
+                    last_exc = e
+                    if client is not None:
+                        try:
+                            client.close()
+                        except Exception:
+                            pass
+                    if not allow_insecure:
+                        # First attempt (strict TLS) failed — retry with cert bypass
+                        continue
+
+            # Both attempts exhausted
+            self.is_connected = False
+            self._db = None
+            short = str(last_exc).split(',')[0].strip()
+            print(f"⚠️  MongoDB unavailable (will retry in {self._RETRY_INTERVAL}s): {short}")
 
     def _try_reconnect_if_due(self):
         """Reconnect only if enough time has passed since the last attempt."""
@@ -164,7 +183,16 @@ class MongoDBManager:
         # Face Database Collection
         if 'face_database' not in self.db.list_collection_names():
             self.db.create_collection('face_database')
-        # Compound index for user_id + name (unique per user)
+        # Drop any old single-field unique index on 'name' that would incorrectly
+        # prevent different users from sharing the same identity name.
+        try:
+            existing_indexes = self.db.face_database.index_information()
+            if 'name_1' in existing_indexes and existing_indexes['name_1'].get('unique'):
+                self.db.face_database.drop_index('name_1')
+                print("⚠️ Dropped stale unique index 'name_1' from face_database collection")
+        except Exception as _idx_err:
+            print(f"[MongoDB] Index cleanup check failed (non-fatal): {_idx_err}")
+        # Compound index for user_id + name (unique per user, not globally)
         self.db.face_database.create_index([('user_id', ASCENDING), ('name', ASCENDING)], unique=True)
         self.db.face_database.create_index([('user_id', ASCENDING)])
         self.db.face_database.create_index([('added_date', DESCENDING)])
@@ -231,7 +259,10 @@ class MongoDBManager:
                     'enabled': False,
                     'name': 'Jarvis',
                     'voice': 'male',
+                    'voice_lock_enabled': False,
                 },
+                'voice_enrolled': False,
+                'voice_embedding': None,
                 'camera_locations': {},
             }
             
@@ -329,6 +360,53 @@ class MongoDBManager:
             print(f"[MongoDB] update_assistant_settings failed: {e}")
             return False
     
+    # ===== Voice Lock =====
+
+    def store_voice_embedding(self, user_id: str, embedding_b64: str) -> bool:
+        """Store a base64-encoded voice embedding in the user document."""
+        db = self._require_db()
+        if db is None:
+            return False
+        try:
+            from bson.objectid import ObjectId
+            result = db.users.update_one(
+                {'_id': ObjectId(user_id)},
+                {'$set': {'voice_embedding': embedding_b64, 'voice_enrolled': True, 'updated_at': datetime.utcnow()}}
+            )
+            return result.modified_count > 0
+        except Exception as e:
+            print(f"[MongoDB] store_voice_embedding failed: {e}")
+            return False
+
+    def get_voice_embedding(self, user_id: str) -> Optional[str]:
+        """Return the stored base64 voice embedding string, or None."""
+        db = self._require_db()
+        if db is None:
+            return None
+        try:
+            from bson.objectid import ObjectId
+            user = db.users.find_one({'_id': ObjectId(user_id)}, {'voice_embedding': 1})
+            return user.get('voice_embedding') if user else None
+        except Exception as e:
+            print(f"[MongoDB] get_voice_embedding failed: {e}")
+            return None
+
+    def delete_voice_embedding(self, user_id: str) -> bool:
+        """Remove the stored voice embedding and mark as not enrolled."""
+        db = self._require_db()
+        if db is None:
+            return False
+        try:
+            from bson.objectid import ObjectId
+            result = db.users.update_one(
+                {'_id': ObjectId(user_id)},
+                {'$unset': {'voice_embedding': ''}, '$set': {'voice_enrolled': False, 'updated_at': datetime.utcnow()}}
+            )
+            return result.modified_count > 0
+        except Exception as e:
+            print(f"[MongoDB] delete_voice_embedding failed: {e}")
+            return False
+
     # ===== Face Database Operations =====
     
     def add_face(self, user_id: str, name: str, embedding: np.ndarray, metadata: Dict) -> bool:

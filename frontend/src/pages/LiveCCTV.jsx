@@ -11,13 +11,12 @@ export default function LiveCCTV() {
   const [annotatedFrame, setAnnotatedFrame] = useState(null)
   const [result, setResult] = useState(null)
   const [cameraIndex, setCameraIndex] = useState(0)
-  const [frameSkip, setFrameSkip] = useState(2)
-  const [isAnalyzing, setIsAnalyzing] = useState(false)
   const webcamRef = useRef(null)
   const overlayCanvasRef = useRef(null)
   const feedContainerRef = useRef(null)
   const intervalRef = useRef(null)
-  const isMonitoringRef = useRef(false)  // stable ref for event handlers
+  const isMonitoringRef  = useRef(false)   // stable ref for event handlers
+  const isAnalyzingRef   = useRef(false)   // stable ref — prevents stale closure in setInterval
 
   const startMonitoring = () => {
     if (isMonitoringRef.current) return  // already running
@@ -26,23 +25,18 @@ export default function LiveCCTV() {
     // Inform Jarvis that live CCTV is now active
     window.dispatchEvent(new CustomEvent('visionguard:page-state-update', { detail: { live_cctv_active: true } }))
     
-    // Process frames periodically
+    // Process frames — interval fires every 1.5s; skip if previous call still running
     intervalRef.current = setInterval(async () => {
-      // Skip if already analyzing
-      if (isAnalyzing) {
-        console.log('⏭️ Skipping frame - analysis in progress')
-        return
-      }
+      if (isAnalyzingRef.current) return  // ref never stale in closures
       
       if (webcamRef.current) {
         const imageSrc = webcamRef.current.getScreenshot()
         if (imageSrc) {
           setCurrentFrame(imageSrc)
-          // Convert base64 to blob and send to backend
           await analyzeFrame(imageSrc)
         }
       }
-    }, frameSkip * 500) // Adjust based on frame skip
+    }, 1500)
   }
 
   const stopMonitoring = () => {
@@ -76,16 +70,16 @@ export default function LiveCCTV() {
 
 
   const analyzeFrame = async (imageBase64) => {
-    setIsAnalyzing(true)
+    isAnalyzingRef.current = true
     try {
-      // Convert base64 to blob
       const response = await fetch(imageBase64)
       const blob = await response.blob()
       
       const formData = new FormData()
-        formData.append("file", blob, "frame.jpg");
-        formData.append("camera_id", "livecctv");
+      formData.append('file', blob, 'frame.jpg')
+      formData.append('camera_id', 'livecctv')
       formData.append('return_annotated', 'true')
+      formData.append('skip_deepfake', 'true')  // Skip slow deepfake model for live frames
 
       const axios = authService.getAuthAxios()
       const apiResponse = await axios.post('/analyze/image', formData, {
@@ -104,7 +98,7 @@ export default function LiveCCTV() {
     } catch (err) {
       console.error('Frame analysis error:', err)
     } finally {
-      setIsAnalyzing(false)
+      isAnalyzingRef.current = false
     }
   }
 
@@ -183,10 +177,10 @@ export default function LiveCCTV() {
         initial={{ opacity: 0, y: -20 }}
         animate={{ opacity: 1, y: 0 }}
       >
-        <h1 className="text-4xl font-bold bg-gradient-primary bg-clip-text text-transparent mb-2">
+        <h1 className="text-4xl font-bold bg-gradient-to-r from-blue-400 to-cyan-400 bg-clip-text text-transparent mb-2">
           Live CCTV Monitoring
         </h1>
-        <p className="text-gray-600">Real-time surveillance and threat detection</p>
+        <p className="text-slate-400">Real-time surveillance and threat detection</p>
       </motion.div>
 
       {/* Telegram Notification Reminder */}
@@ -194,18 +188,18 @@ export default function LiveCCTV() {
         initial={{ opacity: 0, y: -10 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ delay: 0.1 }}
-        className="bg-blue-50 border-l-4 border-blue-500 p-4 rounded-lg"
+        className="bg-blue-900/20 border-l-4 border-blue-500 p-4 rounded-lg"
       >
         <div className="flex items-start gap-3">
           <MessageCircle className="w-5 h-5 text-blue-600 mt-0.5 flex-shrink-0" />
           <div className="flex-1">
-            <p className="text-sm text-blue-900">
+            <p className="text-sm text-blue-200">
               <strong>💡 Tip:</strong> Enable Telegram notifications to receive instant alerts when unknown faces are detected - 
               even when you're away from your computer!
             </p>
             <Link
               to="/settings"
-              className="inline-flex items-center gap-1 text-sm text-blue-700 hover:text-blue-800 font-medium mt-2"
+              className="inline-flex items-center gap-1 text-sm text-blue-400 hover:text-blue-300 font-medium mt-2"
             >
               <Settings className="w-4 h-4" />
               Configure in Settings →
@@ -217,10 +211,10 @@ export default function LiveCCTV() {
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Camera Feed */}
         <div className="lg:col-span-2 space-y-4">
-          <div className="bg-white rounded-2xl shadow-lg p-6 border border-gray-100">
+          <div className="bg-[#060c18] rounded-2xl border border-slate-800/60 p-6">
             <div className="flex items-center justify-between mb-4">
-              <h2 className="text-xl font-bold text-gray-900 flex items-center">
-                <Video className="w-6 h-6 mr-2 text-primary-500" />
+              <h2 className="text-xl font-bold text-white flex items-center">
+                <Video className="w-6 h-6 mr-2 text-blue-400" />
                 Live Feed {annotatedFrame && '(Annotated)'}
               </h2>
               <div className="flex items-center space-x-2">
@@ -265,9 +259,9 @@ export default function LiveCCTV() {
 
           {/* Object Detection Details */}
           {result && isMonitoring && result.objects && result.objects.length > 0 && (
-            <div className="bg-white rounded-2xl shadow-lg p-6 border border-gray-100">
-              <h3 className="text-lg font-semibold text-gray-900 mb-4 flex items-center">
-                <Target className="w-5 h-5 mr-2 text-blue-600" />
+            <div className="bg-[#060c18] rounded-2xl border border-slate-800/60 p-6">
+              <h3 className="text-lg font-semibold text-white mb-4 flex items-center">
+                <Target className="w-5 h-5 mr-2 text-blue-400" />
                 Detected Objects ({result.objects.length})
               </h3>
               <div className="space-y-2 max-h-60 overflow-y-auto">
@@ -278,8 +272,8 @@ export default function LiveCCTV() {
                       key={idx}
                       className={`p-3 rounded-lg border-2 transition-all ${
                         isSuspicious
-                          ? 'bg-red-50 border-red-300'
-                          : 'bg-gray-50 border-gray-200'
+                          ? 'bg-red-900/20 border-red-500/50'
+                          : 'bg-slate-800/30 border-slate-700/40'
                       }`}
                     >
                       <div className="flex items-center justify-between">
@@ -289,7 +283,7 @@ export default function LiveCCTV() {
                           )}
                           <div>
                             <span className={`font-semibold text-lg ${
-                              isSuspicious ? 'text-red-900' : 'text-gray-900'
+                              isSuspicious ? 'text-red-300' : 'text-white'
                             }`}>
                               {obj.track_id != null && (
                               <span className="mr-1 px-1.5 py-0.5 bg-blue-100 text-blue-700 text-xs rounded font-mono">
@@ -307,15 +301,15 @@ export default function LiveCCTV() {
                         </div>
                         <div className="text-right">
                           <div className={`text-lg font-bold ${
-                            isSuspicious ? 'text-red-700' : 'text-gray-700'
+                            isSuspicious ? 'text-red-400' : 'text-slate-400'
                           }`}>
                             {(obj.confidence * 100).toFixed(1)}%
                           </div>
-                          <div className="text-xs text-gray-500">confidence</div>
+                          <div className="text-xs text-slate-500">confidence</div>
                         </div>
                       </div>
                       {obj.bbox && (
-                        <div className="mt-2 text-xs text-gray-600">
+                        <div className="mt-2 text-xs text-slate-500">
                           Position: [{obj.bbox.map(v => Math.round(v)).join(', ')}]
                         </div>
                       )}
@@ -329,39 +323,23 @@ export default function LiveCCTV() {
           )}
 
           {/* Controls */}
-          <div className="bg-white rounded-2xl shadow-lg p-6 border border-gray-100">
-            <h3 className="text-lg font-semibold text-gray-900 mb-4">Controls</h3>
+          <div className="bg-[#060c18] rounded-2xl border border-slate-800/60 p-6">
+            <h3 className="text-lg font-semibold text-white mb-4">Controls</h3>
             
-            <div className="grid grid-cols-2 gap-4 mb-4">
+            <div className="grid grid-cols-1 gap-4 mb-4">
               <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">
+                <label className="block text-sm font-medium text-slate-300 mb-2">
                   Camera Source
                 </label>
                 <select
                   value={cameraIndex}
                   onChange={(e) => setCameraIndex(parseInt(e.target.value))}
                   disabled={isMonitoring}
-                  className="w-full px-4 py-2 border-2 border-gray-200 rounded-xl focus:border-primary-500 outline-none disabled:opacity-50"
+                  className="w-full px-4 py-2 bg-[#091220] border border-slate-700/50 rounded-xl focus:border-blue-500 outline-none disabled:opacity-50 text-white"
                 >
                   <option value={0}>Default Camera (0)</option>
                   <option value={1}>External Camera (1)</option>
                   <option value={2}>Camera 2</option>
-                </select>
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">
-                  Processing Speed
-                </label>
-                <select
-                  value={frameSkip}
-                  onChange={(e) => setFrameSkip(parseInt(e.target.value))}
-                  className="w-full px-4 py-2 border-2 border-gray-200 rounded-xl focus:border-primary-500 outline-none"
-                >
-                  <option value={1}>Very Detailed (Slow)</option>
-                  <option value={2}>Balanced (Recommended)</option>
-                  <option value={5}>Fast</option>
-                  <option value={10}>Very Fast</option>
                 </select>
               </div>
             </div>
@@ -387,7 +365,7 @@ export default function LiveCCTV() {
             </div>
 
             {/* Assistant Call — opens the global Siri-style overlay */}
-            <div className="mt-4 pt-4 border-t border-gray-100">
+            <div className="mt-4 pt-4 border-t border-slate-700/50">
               <button
                 onClick={() => {
                   try { window.dispatchEvent(new CustomEvent('visionguard:jarvis-open')) } catch {}
@@ -397,8 +375,8 @@ export default function LiveCCTV() {
                 <Mic className="w-5 h-5" />
                 Talk to Jarvis
               </button>
-              <p className="text-xs text-gray-500 mt-2 text-center">
-                Or say <span className="font-semibold text-gray-700">"Hey Jarvis"</span> anytime
+              <p className="text-xs text-slate-500 mt-2 text-center">
+                Or say <span className="font-semibold text-slate-300">"Hey Jarvis"</span> anytime
               </p>
             </div>
           </div>
@@ -426,20 +404,20 @@ export default function LiveCCTV() {
               </div>
 
               {/* Threat Category */}
-              <div className="bg-white rounded-2xl shadow-lg p-6 border border-gray-100">
-                <h3 className="text-sm font-semibold text-gray-600 mb-2">Threat Type</h3>
-                <p className="text-xl font-bold text-gray-900">
+              <div className="bg-[#060c18] rounded-2xl border border-slate-800/60 p-6">
+                <h3 className="text-sm font-semibold text-slate-400 mb-2">Threat Type</h3>
+                <p className="text-xl font-bold text-white">
                   {result.risk_assessment.threat_category || 'NONE'}
                 </p>
               </div>
 
               {/* Detection Stats */}
-              <div className="bg-white rounded-2xl shadow-lg p-6 border border-gray-100">
-                <h3 className="text-sm font-semibold text-gray-600 mb-4">Live Detection</h3>
+              <div className="bg-[#060c18] rounded-2xl border border-slate-800/60 p-6">
+                <h3 className="text-sm font-semibold text-slate-400 mb-4">Live Detection</h3>
                 
                 <div className="space-y-3">
                   <div className="flex items-center justify-between">
-                    <span className="text-sm text-gray-700">Deepfake</span>
+                    <span className="text-sm text-slate-300">Deepfake</span>
                     <span className={`px-3 py-1 rounded-full text-xs font-bold ${
                       result.deepfake.status === 'fake' ? 'bg-red-100 text-red-800' : 'bg-green-100 text-green-800'
                     }`}>
@@ -448,21 +426,21 @@ export default function LiveCCTV() {
                   </div>
 
                   <div className="flex items-center justify-between">
-                    <span className="text-sm text-gray-700">Identity</span>
-                    <span className="text-sm font-semibold text-gray-900">
+                    <span className="text-sm text-slate-300">Identity</span>
+                    <span className="text-sm font-semibold text-white">
                       {result.face_recognition.identity}
                     </span>
                   </div>
 
                   <div className="flex items-center justify-between">
-                    <span className="text-sm text-gray-700">Objects</span>
-                    <span className="text-sm font-semibold text-gray-900">
+                    <span className="text-sm text-slate-300">Objects</span>
+                    <span className="text-sm font-semibold text-white">
                       {result.objects.length}
                     </span>
                   </div>
 
                   <div className="flex items-center justify-between">
-                    <span className="text-sm text-gray-700">Suspicious</span>
+                    <span className="text-sm text-slate-300">Suspicious</span>
                     <span className={`text-sm font-semibold ${
                       result.suspicious_objects.length > 0 ? 'text-red-600' : 'text-green-600'
                     }`}>
@@ -472,7 +450,7 @@ export default function LiveCCTV() {
 
                   {result.tracking && result.tracking.tracks && (
                     <div className="flex items-center justify-between">
-                      <span className="text-sm text-gray-700">Tracked IDs</span>
+                    <span className="text-sm text-slate-300">Tracked IDs</span>
                       <span className="text-sm font-semibold text-blue-600">
                         {result.tracking.tracks.filter(t => t.missed === 0).length}
                       </span>
@@ -494,7 +472,7 @@ export default function LiveCCTV() {
                   )}
 
                   {result.risk_assessment.threats.is_unknown_person && (
-                    <div className="bg-gradient-warning text-gray-900 p-4 rounded-xl">
+                    <div className="bg-gradient-warning text-white p-4 rounded-xl">
                       <p className="font-bold text-sm">⚠️ UNKNOWN PERSON</p>
                     </div>
                   )}
@@ -508,13 +486,13 @@ export default function LiveCCTV() {
               )}
 
               {/* Risk Reasons */}
-              <div className="bg-white rounded-2xl shadow-lg p-6 border border-gray-100">
-                <h3 className="text-sm font-semibold text-gray-600 mb-3">Reasons</h3>
+              <div className="bg-[#060c18] rounded-2xl border border-slate-800/60 p-6">
+                <h3 className="text-sm font-semibold text-slate-400 mb-3">Reasons</h3>
                 <div className="space-y-2 max-h-60 overflow-y-auto">
                   {result.risk_assessment.reasons.map((reason, idx) => (
                     <div key={idx} className="flex items-start space-x-2">
-                      <div className="w-2 h-2 bg-primary-500 rounded-full mt-1.5 flex-shrink-0"></div>
-                      <p className="text-xs text-gray-700">{reason}</p>
+                      <div className="w-2 h-2 bg-blue-500 rounded-full mt-1.5 flex-shrink-0"></div>
+                      <p className="text-xs text-slate-300">{reason}</p>
                     </div>
                   ))}
                 </div>
@@ -523,10 +501,10 @@ export default function LiveCCTV() {
           )}
 
           {!isMonitoring && (
-            <div className="bg-blue-50 rounded-2xl p-6 border border-blue-200">
-              <AlertCircle className="w-8 h-8 text-blue-600 mb-3" />
-              <h3 className="font-semibold text-blue-900 mb-2">Start Monitoring</h3>
-              <p className="text-sm text-blue-800">
+            <div className="bg-blue-900/20 rounded-2xl p-6 border border-blue-500/30">
+              <AlertCircle className="w-8 h-8 text-blue-400 mb-3" />
+              <h3 className="font-semibold text-blue-200 mb-2">Start Monitoring</h3>
+              <p className="text-sm text-blue-300">
                 Click "Start Monitoring" to begin real-time threat detection
               </p>
             </div>

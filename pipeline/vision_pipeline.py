@@ -118,13 +118,15 @@ class VisionPipeline:
         deepfake_config = self.config['models']['deepfake']
         deepfake_threshold = deepfake_config.get('threshold', 0.35)
         gemini_api_key = deepfake_config.get('gemini_api_key', None)
+        gemini_model_name = deepfake_config.get('gemini_model', 'gemini-2.0-flash')
         use_gemini_for_images = deepfake_config.get('use_gemini_for_images', False)
         
         # Pass gemini_api_key if available
         if gemini_api_key and gemini_api_key.strip():
             self.deepfake_detector = DeepfakeDetector(
                 threshold=deepfake_threshold,
-                gemini_api_key=gemini_api_key
+                gemini_api_key=gemini_api_key,
+                gemini_model_name=gemini_model_name,
             )
         else:
             self.deepfake_detector = DeepfakeDetector(threshold=deepfake_threshold)
@@ -191,8 +193,9 @@ class VisionPipeline:
         image: Union[str, np.ndarray, Image.Image],
         return_annotated: bool = True,
         user_id: Optional[str] = None,
-        camera_id: Optional[str] = None
-    ) -> Dict:
+        camera_id: Optional[str] = None,
+        skip_deepfake: bool = False,        is_video_frame: bool = False,
+        is_first_video_frame: bool = False,    ) -> Dict:
         """
         Process a single image through the complete pipeline.
         
@@ -240,16 +243,28 @@ class VisionPipeline:
             deepfake_input = image
         
         # ====== 1. DEEPFAKE DETECTION ======
-        print("   1️⃣ Deepfake Detection...")
-        # Use Gemini-only mode for image analysis if configured
-        if self.use_gemini_for_images and hasattr(self.deepfake_detector, 'gemini_model') and self.deepfake_detector.gemini_model:
-            print("   🤖 Using Gemini API for image analysis...")
+        if skip_deepfake:
+            # Skip for live CCTV — too slow for real-time and meaningless on webcam frames
+            deepfake_result = {
+                'label': 'REAL', 'confidence': 0.0, 'fake_probability': 0.0,
+                'is_fake': False, 'model': 'skipped'
+            }
+        # 🔥 OPTIMIZATION: For video, only use Gemini on first frame to save API tokens
+        # For subsequent frames, use fast local model. One Gemini call per video = massive savings!
+        elif is_video_frame and not is_first_video_frame:
+            # Skip Gemini for video frames (except first) — use fast local model instead
+            print("   1️⃣ Deepfake Detection (local model, video optimization)...")
+            deepfake_result = self.deepfake_detector.predict(deepfake_input)
+        elif self.use_gemini_for_images and hasattr(self.deepfake_detector, 'gemini_model') and self.deepfake_detector.gemini_model:
+            gemini_source = " (first video frame only)" if is_video_frame else ""
+            print(f"   🤖 Using Gemini API for image analysis{gemini_source}...")
             deepfake_result = self.deepfake_detector._predict_with_gemini(deepfake_input)
             if (not deepfake_result) or (deepfake_result.get('label') == 'UNKNOWN'):
                 # Fallback to primary model if Gemini fails/returns unknown
                 print("   ⚠️ Gemini unavailable/uncertain, using primary model...")
                 deepfake_result = self.deepfake_detector.predict(deepfake_input)
         else:
+            print("   1️⃣ Deepfake Detection...")
             deepfake_result = self.deepfake_detector.predict(deepfake_input)
         
         # ====== 2. FACE RECOGNITION ======
@@ -648,6 +663,7 @@ class VisionPipeline:
             List of results per processed frame
         """
         print(f"\n🎥 Processing Video: {video_path}")
+        print(f"💰 OPTIMIZATION: Gemini deepfake detection runs ONLY on first frame (not every frame)")
         
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
@@ -656,7 +672,17 @@ class VisionPipeline:
         results = []
         writer = None
         frame_count = 0
-        
+        first_processed_frame = True  # Track first processed frame for Gemini optimization
+
+        # Pre-load face DB once so we don't hit MongoDB on every frame
+        if self.face_recognizer.use_mongodb and self.face_recognizer.mongodb_manager:
+            print(f"📂 Pre-loading face database for video processing...")
+            self.face_recognizer.face_database = self.face_recognizer.mongodb_manager.get_all_faces(
+                self.face_recognizer.user_id
+            )
+            print(f"✅ Loaded {len(self.face_recognizer.face_database)} identities (cached for video)")
+        self.face_recognizer._skip_db_reload = True
+
         # Setup video writer
         if output_path:
             fps = int(cap.get(cv2.CAP_PROP_FPS))
@@ -675,8 +701,14 @@ class VisionPipeline:
             if frame_count % frame_skip != 0:
                 continue
             
-            # Process frame
-            result = self.process_image(frame, return_annotated=output_path is not None)
+            # Process frame with Gemini optimization: only first frame uses Gemini
+            result = self.process_image(
+                frame,
+                return_annotated=output_path is not None,
+                is_video_frame=True,  # Tell analyzer this is a video frame
+                is_first_video_frame=first_processed_frame  # Only first frame uses Gemini
+            )
+            first_processed_frame = False  # After first frame, use local model for deepfake
             result['frame_number'] = frame_count
             results.append(result)
             
@@ -690,7 +722,10 @@ class VisionPipeline:
         if writer:
             writer.release()
             print(f"\n💾 Saved annotated video: {output_path}")
-        
+
+        # Re-enable per-call reload for subsequent live/image requests
+        self.face_recognizer._skip_db_reload = False
+
         print(f"\n✅ Processed {len(results)} frames")
         return results
     

@@ -401,9 +401,10 @@ class FaceRecognizer:
         Returns:
             Dictionary with recognition results
         """
-        # CRITICAL: Reload database from MongoDB before EVERY recognition 
-        # This ensures deletions/additions are immediately reflected
-        if self.use_mongodb and self.mongodb_manager:
+        # Reload database from MongoDB before each recognition so that live
+        # add/delete operations are reflected immediately.  During batch video
+        # processing _skip_db_reload is set True so we only hit MongoDB once.
+        if self.use_mongodb and self.mongodb_manager and not getattr(self, '_skip_db_reload', False):
             print(f"🔄 Reloading face database from MongoDB for user: {self.user_id}...")
             self.face_database = self.mongodb_manager.get_all_faces(self.user_id)
             print(f"📂 Loaded {len(self.face_database)} identities for user {self.user_id}")

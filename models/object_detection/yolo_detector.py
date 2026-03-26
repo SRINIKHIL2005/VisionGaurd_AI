@@ -61,22 +61,23 @@ class YOLODetector:
         agnostic_nms: bool = False
     ):
         """
-        Initialize YOLO detector.
+        Initialize YOLO detector with dual model support (v8 + v11).
         
         Args:
-            model_name: YOLO model variant
-                       'yolov8n.pt' - Nano (fastest, ~80% accuracy)
+            model_name: YOLOv8 model variant (general object detection)
+                       'yolov8n.pt' - Nano (fastest, ~80% accuracy, COCO 80 classes)
                        'yolov8s.pt' - Small (balanced, ~85% accuracy)
                        'yolov8m.pt' - Medium (good accuracy, ~88% accuracy)
                        'yolov8l.pt' - Large (high accuracy, ~90% accuracy)
                        'yolov8x.pt' - Extra Large (best accuracy, ~91% accuracy)
             confidence: Minimum confidence threshold (0-1)
-                       Recommended: 0.35-0.45 for better accuracy
+                       Recommended: 0.35-0.45 for better recall
             iou_threshold: IoU threshold for NMS (0-1)
                           Recommended: 0.45-0.60 to reduce duplicates
             device: 'auto', 'cuda', or 'cpu'
             suspicious_objects: List of object classes to flag as suspicious
-            weapon_model_path: Path to custom weapon detection model (optional)
+            weapon_model_path: Path to YOLOv11 weapon detection model
+                              Example: 'Learning/best.pt' (YOLOv11 nano trained on weapons)
             weapon_confidence: Confidence threshold for weapon detection (higher = fewer false positives)
             imgsz: Input image size (640, 800, 1024)
                   Larger = more accurate but slower
@@ -113,17 +114,16 @@ class YOLODetector:
             return
         
         try:
-            # Load YOLO model
+            # Load YOLOv8 model for general object detection
             self.model = YOLO(model_name)
             self.model.to(self.device)
             
-            print(f"✅ YOLO model loaded: {model_name}")
-            print(f"📊 Classes: {len(self.model.names)} object classes")
-            print(f"⚠️  Note: Standard YOLO (COCO dataset) does NOT include 'gun' or 'weapon' classes")
-            print(f"   Detected objects may include: knife, scissors, baseball bat, bottle, cell phone, etc.")
-            print(f"   For weapon detection, consider training a custom model or using specialized models")
+            print(f"✅ YOLOv8 general detector loaded: {model_name}")
+            print(f"📊 Classes: {len(self.model.names)} COCO classes (people, cars, animals, etc.)")
+            print(f"   Detected objects: person, car, dog, cat, bottle, etc.")
+            print(f"   Note: YOLOv8 focuses on general objects, not specialized weapons")
             
-            # Try to load custom weapon detection model
+            # Try to load YOLOv11 weapon detection model
             self.weapon_model = None
             if weapon_model_path:
                 try:
@@ -131,13 +131,14 @@ class YOLODetector:
                     if os.path.exists(weapon_model_path):
                         self.weapon_model = YOLO(weapon_model_path)
                         self.weapon_model.to(self.device)
-                        print(f"\n🔫 WEAPON DETECTION MODEL LOADED: {weapon_model_path}")
-                        print(f"   Additional classes: {len(self.weapon_model.names)}")
-                        print(f"   ✅ System now supports firearm/weapon detection!")
+                        print(f"\n🔫 YOLOv11 WEAPON DETECTOR LOADED: {weapon_model_path}")
+                        print(f"   Weapon classes: {len(self.weapon_model.names)} (knife, gun, grenade, etc.)")
+                        print(f"   ✅ System now supports advanced firearm/weapon detection!")
+                        print(f"   📌 Models: YOLOv8 (general) + YOLOv11 (weapons)")
                     else:
                         print(f"\n⚠️  Weapon model not found at: {weapon_model_path}")
                 except Exception as e:
-                    print(f"\n⚠️  Could not load weapon model: {e}")
+                    print(f"\n⚠️  Could not load YOLOv11 weapon model: {e}")
             else:
                 # Auto-detect weapon model in common locations
                 import os

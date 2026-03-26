@@ -38,6 +38,7 @@ export default function JarvisAssistant() {
   const [micBlocked, setMicBlocked]   = useState(false)
   const [assistantSettings, setAssistantSettings] = useState({ enabled: false, name: 'Jarvis', voice: 'male', web_control_enabled: false })
   const [liveCctvActive, setLiveCctvActive] = useState(false)
+  const [authDenied, setAuthDenied]         = useState(false)
 
   // Refs that don't need re-render
   const settingsRef        = useRef({ enabled: false, name: 'Jarvis', voice: 'male', web_control_enabled: false })
@@ -448,6 +449,8 @@ export default function JarvisAssistant() {
     setOpen(true)
     setStatus(null)
     setTranscript('')
+    // Tell WakeWordListener to stay paused — it must not open its own SR while Jarvis is active
+    try { window.dispatchEvent(new CustomEvent('visionguard:jarvis-opened')) } catch {}
 
     if (fromWake) {
       if (inlineCommand) {
@@ -494,17 +497,23 @@ export default function JarvisAssistant() {
     const onAnalysis = (e) => {
       if (e?.detail) latestAnalysisRef.current = e.detail
     }
+    const onAuthFailed = () => {
+      setAuthDenied(true)
+      setTimeout(() => setAuthDenied(false), 3500)
+    }
 
     window.addEventListener('visionguard:wake',               onWake)
     window.addEventListener('visionguard:jarvis-open',        onJarvisOpen)
     window.addEventListener('visionguard:assistant-settings', onSettings)
     window.addEventListener('visionguard:live-analysis',      onAnalysis)
+    window.addEventListener('visionguard:auth-failed',        onAuthFailed)
 
     return () => {
       window.removeEventListener('visionguard:wake',               onWake)
       window.removeEventListener('visionguard:jarvis-open',        onJarvisOpen)
       window.removeEventListener('visionguard:assistant-settings', onSettings)
       window.removeEventListener('visionguard:live-analysis',      onAnalysis)
+      window.removeEventListener('visionguard:auth-failed',        onAuthFailed)
     }
   }, [handleOpen])
 
@@ -512,6 +521,7 @@ export default function JarvisAssistant() {
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
+    <>
     <AnimatePresence>
       {open && (
         <>
@@ -739,5 +749,20 @@ export default function JarvisAssistant() {
         </>
       )}
     </AnimatePresence>
+
+    {/* Voice Lock denied toast */}
+    <AnimatePresence>
+      {authDenied && (
+        <motion.div
+          initial={{ opacity: 0, y: 30 }}
+          animate={{ opacity: 1, y: 0 }}
+          exit={{ opacity: 0, y: 30 }}
+          className="fixed bottom-28 right-7 z-50 bg-red-900/90 border border-red-500/40 text-red-200 px-5 py-3 rounded-xl shadow-xl text-sm font-medium flex items-center gap-2 backdrop-blur-sm"
+        >
+          🔒 Unauthorized voice — access denied
+        </motion.div>
+      )}
+    </AnimatePresence>
+    </>
   )
 }

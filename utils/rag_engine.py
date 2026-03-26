@@ -164,7 +164,7 @@ class RAGEngine:
     def add_log(self, doc: Dict[str, Any]) -> None:
         """Add a single new detection log to the in-memory index (live update)."""
         if self._index is None:
-            return  # index not built yet — will be picked up on next refresh
+            return  # engine not yet built; caller (api/main.py) only calls this when engine exists
         try:
             self._load_model()
             import faiss  # noqa: F401
@@ -178,7 +178,7 @@ class RAGEngine:
             print(f"[RAG] add_log failed: {e}")
 
     def is_stale(self) -> bool:
-        """Return True if the index needs to be rebuilt."""
+        """Return True if the index needs to be rebuilt (time-based)."""
         if self._last_built is None:
             return True
         elapsed = (datetime.now() - self._last_built).total_seconds()

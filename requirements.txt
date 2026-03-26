@@ -65,6 +65,10 @@ sentence-transformers>=2.7.0
 # ===== Offline TTS (Assistant voice) =====
 pyttsx3>=2.90
 
+# ===== Voice Lock (owner speaker verification) =====
+resemblyzer>=0.1.2              # Pretrained GE2E speaker embeddings
+soundfile>=0.12.1               # WAV decoding for resemblyzer
+
 # ===== Configuration & Logging =====
 pyyaml>=6.0.1
 loguru>=0.7.2

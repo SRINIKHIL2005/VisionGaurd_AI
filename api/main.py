@@ -48,8 +48,21 @@ try:
 except Exception:
     pyttsx3 = None
 
+VOICE_SIMILARITY_THRESHOLD = 0.30  # cosine similarity cutoff for same-speaker
+
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
+
+try:
+    from utils.voice_auth import get_embedding, cosine_similarity, embedding_to_b64, b64_to_embedding
+    _voice_auth_available = True
+except Exception as _va_err:
+    get_embedding = None  # type: ignore
+    cosine_similarity = None  # type: ignore
+    embedding_to_b64 = None  # type: ignore
+    b64_to_embedding = None  # type: ignore
+    _voice_auth_available = False
+    print(f"[VoiceAuth] Import skipped (resemblyzer not installed): {_va_err}")
 
 # RAG + Gemini assistant (imported AFTER sys.path is set so 'utils' resolves)
 try:
@@ -82,7 +95,11 @@ app = FastAPI(
 # ===== CORS Configuration =====
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173"],  # React dev servers
+    allow_origins=["http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "https://n6ftzfnm-3000.inc1.devtunnels.ms",  # dev tunnel
+        "https://*.devtunnels.ms",
+        ],  # React dev servers
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -93,8 +110,8 @@ pipeline: Optional[VisionPipeline] = None
 
 # ── Edge TTS (primary) ───────────────────────────────────────────────────────
 EDGE_VOICES = {
-    'male':   'en-US-GuyNeural',
-    'female': 'en-US-JennyNeural',
+    'male':   'en-US-ChristopherNeural',   # deep, unambiguously male
+    'female': 'en-US-JennyNeural',          # clear American female
 }
 
 async def _synthesize_edge_tts(text: str, voice_pref: str = 'male') -> Optional[bytes]:
@@ -127,8 +144,9 @@ _last_live_telegram_enqueue_at: dict = {}
 _ANALYZE_CONCURRENCY = int(os.getenv("VG_ANALYZE_CONCURRENCY", "1"))
 _analyze_semaphore = asyncio.Semaphore(max(1, _ANALYZE_CONCURRENCY))
 
-# Module-level RAG + Gemini singletons (initialised in startup_event)
-rag_engine = None
+# Module-level RAG + Gemini — one engine per user, created on first query
+rag_engines: dict = {}   # user_id → RAGEngine
+_assistant_cfg: dict = {}
 gemini_client = None
 
 
@@ -136,22 +154,19 @@ gemini_client = None
 @app.on_event("startup")
 async def startup_event():
     """Initialize pipeline, RAG engine, and Gemini client on startup"""
-    global pipeline, rag_engine, gemini_client
+    global pipeline, rag_engines, _assistant_cfg, gemini_client
     print("\n🚀 Starting VisionGuard AI API...")
     pipeline = VisionPipeline(config_path="config/settings.yaml")
 
     # ── RAG + Gemini assistant ─────────────────────────────────────────────
     try:
         assistant_cfg = pipeline.config.get('assistant', {})
+        _assistant_cfg = assistant_cfg
         api_key = (assistant_cfg.get('gemini_api_key') or '').strip()
         if api_key and RAGEngine is not None and GeminiClient is not None:
             model_name = assistant_cfg.get('gemini_model', 'gemini-2.0-flash')
             gemini_client = GeminiClient(api_key, model_name)
-            rag_engine = RAGEngine(pipeline.mongodb_manager, assistant_cfg)
-            default_uid = (pipeline.config.get('mongodb', {}).get('default_user_id') or '').strip()
-            if default_uid:
-                rag_engine.build_index(default_uid)
-                print(f"✅ RAG index built ({len(rag_engine._log_texts)} logs)")
+            print("✅ RAG engine ready (per-user indexes built on first query)")
         else:
             if not api_key:
                 print("⚠️  No Gemini API key in settings.yaml — assistant uses fallback responses")
@@ -163,6 +178,16 @@ async def startup_event():
 
     # Telegram is initialized on-demand per user via /user/telegram-settings
     # (avoids multiple instances and ensures user-specific credentials)
+
+
+def _get_rag_for_user(user_id: str) -> "RAGEngine":
+    """Return (and lazily create/refresh) the per-user RAGEngine instance."""
+    if user_id not in rag_engines:
+        rag_engines[user_id] = RAGEngine(pipeline.mongodb_manager, _assistant_cfg)
+    engine = rag_engines[user_id]
+    if engine.is_stale():
+        engine.build_index(user_id)
+    return engine
 
 
 @app.on_event("shutdown")
@@ -244,7 +269,18 @@ class AssistantSettingsRequest(BaseModel):
     enabled: bool = False
     name: str = "Jarvis"  # kept for backward compatibility; ignored
     voice: str = "male"  # 'male' | 'female'
-    web_control_enabled: bool = False  # Allow Jarvis to navigate UI and control features
+    web_control_enabled: bool = False
+    voice_lock_enabled: bool = False   # require owner voice verification after wake word
+
+
+class VoiceEnrollRequest(BaseModel):
+    """Audio bytes (WAV or WebM) encoded as base64 for voice enrollment."""
+    audio_base64: str
+
+
+class VoiceVerifyRequest(BaseModel):
+    """Audio bytes (WAV or WebM) encoded as base64 for speaker verification."""
+    audio_base64: str
 
 
 class AssistantNarrateRequest(BaseModel):
@@ -314,6 +350,9 @@ def _select_voice_id(engine, preference: str) -> Optional[str]:
     except Exception:
         voices = []
 
+    if not voices:
+        return None
+
     pref = (preference or 'male').strip().lower()
     if pref not in {'male', 'female'}:
         pref = 'male'
@@ -324,24 +363,50 @@ def _select_voice_id(engine, preference: str) -> Optional[str]:
         except Exception:
             return ""
 
-    # First pass: explicit gender keywords
-    key = 'female' if pref == 'female' else 'male'
-    for v in voices:
-        if key in voice_text(v):
-            return getattr(v, 'id', None)
+    # Broad keyword lists — covers desktop, mobile, and Win11 online voices
+    MALE_HINTS = [
+        'david', 'mark', 'mark mobile', 'george', 'james', 'guy', 'ryan',
+        'richard', 'christopher', 'eric', 'brian', 'andrew', 'liam',
+        'microsoft guy', 'microsoft david', 'microsoft mark',
+    ]
+    FEMALE_HINTS = [
+        'zira', 'hazel', 'susan', 'helen', 'catherine', 'eva',
+        'jenny', 'aria', 'emma', 'ava', 'sonia', 'natasha', 'linda',
+        'microsoft zira', 'microsoft hazel',
+    ]
 
-    # Second pass: common Windows SAPI voice names (best-effort)
-    if pref == 'female':
-        hints = ['zira', 'hazel', 'susan', 'helen', 'catherine', 'eva', 'jenny', 'aria']
-    else:
-        hints = ['david', 'mark', 'george', 'james', 'guy', 'ryan']
+    preferred_hints = MALE_HINTS if pref == 'male' else FEMALE_HINTS
+    opposite_hints  = FEMALE_HINTS if pref == 'male' else MALE_HINTS
 
-    for hint in hints:
+    # Pass 1: find a voice that matches the preferred gender keywords
+    for hint in preferred_hints:
         for v in voices:
             if hint in voice_text(v):
-                return getattr(v, 'id', None)
+                vid = getattr(v, 'id', None)
+                if vid:
+                    print(f"[TTS] Selected {pref} voice: {getattr(v, 'name', vid)}")
+                    return vid
 
-    return None
+    # Pass 2: find a voice that is NOT a known opposite-gender voice
+    #          (better than silently using the wrong gender)
+    opposite_ids = set()
+    for hint in opposite_hints:
+        for v in voices:
+            if hint in voice_text(v):
+                vid = getattr(v, 'id', None)
+                if vid:
+                    opposite_ids.add(vid)
+
+    for v in voices:
+        vid = getattr(v, 'id', None)
+        if vid and vid not in opposite_ids:
+            print(f"[TTS] No {pref} voice found; using: {getattr(v, 'name', vid)}")
+            return vid
+
+    # Pass 3: absolute fallback — at least something speaks
+    first_id = getattr(voices[0], 'id', None)
+    print(f"[TTS] Fallback: using first available voice: {getattr(voices[0], 'name', first_id)}")
+    return first_id
 
 
 def _synthesize_speech_wav_bytes_with_voice(text: str, preference: str) -> Optional[bytes]:
@@ -522,6 +587,9 @@ async def refresh_token(request: RefreshRequest):
 
     user = pipeline.mongodb_manager.get_user_by_id(user_id)
     if not user:
+        # Distinguish: DB is down vs user genuinely missing
+        if not pipeline.mongodb_manager.is_connected:
+            raise HTTPException(status_code=503, detail="Database temporarily unavailable — try again shortly")
         raise HTTPException(status_code=404, detail="User not found")
 
     access_token = create_access_token(data={
@@ -592,12 +660,17 @@ async def get_assistant_settings(current_user: dict = Depends(get_current_user))
     if voice not in {'male', 'female'}:
         voice = 'male'
 
+    voice_lock_enabled = bool(settings.get('voice_lock_enabled', False))
+    enrolled = bool(user.get('voice_enrolled', False))
+
     return {
         "settings": {
             "enabled": bool(settings.get('enabled', False)),
             "name": name,
             "voice": voice,
             "web_control_enabled": bool(settings.get('web_control_enabled', False)),
+            "voice_lock_enabled": voice_lock_enabled,
+            "voice_enrolled": enrolled,
         }
     }
 
@@ -622,6 +695,7 @@ async def update_assistant_settings(
         'name': name,
         'voice': voice,
         'web_control_enabled': bool(request.web_control_enabled),
+        'voice_lock_enabled': bool(request.voice_lock_enabled),
     }
 
     ok = pipeline.mongodb_manager.update_assistant_settings(current_user['user_id'], settings_doc)
@@ -629,6 +703,88 @@ async def update_assistant_settings(
         raise HTTPException(status_code=500, detail="Failed to update assistant settings")
 
     return {"message": "Assistant settings updated", "settings": settings_doc}
+
+
+# ===== Voice Lock Endpoints =====
+
+@app.post("/user/enroll-voice", tags=["User"])
+async def enroll_voice(
+    request: VoiceEnrollRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Enroll the owner's voice. Stores a speaker embedding in the user document."""
+    if not _voice_auth_available or get_embedding is None:
+        raise HTTPException(status_code=503, detail="Voice auth not available — install resemblyzer")
+    if pipeline is None or not hasattr(pipeline, 'mongodb_manager') or pipeline.mongodb_manager is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    try:
+        audio_bytes = base64.b64decode(request.audio_base64)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64 audio data")
+    embedding = get_embedding(audio_bytes)
+    if embedding is None:
+        raise HTTPException(status_code=422, detail="Could not extract voice embedding — audio may be too short or unsupported")
+    b64 = embedding_to_b64(embedding)
+    ok = pipeline.mongodb_manager.store_voice_embedding(current_user['user_id'], b64)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to store voice embedding")
+    return {"success": True, "message": "Voice enrolled successfully"}
+
+
+@app.delete("/user/enroll-voice", tags=["User"])
+async def delete_voice_enrollment(current_user: dict = Depends(get_current_user)):
+    """Remove the owner's voice embedding and disable voice lock."""
+    if pipeline is None or not hasattr(pipeline, 'mongodb_manager') or pipeline.mongodb_manager is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    pipeline.mongodb_manager.delete_voice_embedding(current_user['user_id'])
+    # Also turn off voice_lock_enabled in assistant_settings
+    user = pipeline.mongodb_manager.get_user_by_id(current_user['user_id'])
+    if user:
+        settings = dict(user.get('assistant_settings') or {})
+        settings['voice_lock_enabled'] = False
+        pipeline.mongodb_manager.update_assistant_settings(current_user['user_id'], settings)
+    return {"success": True, "message": "Voice enrollment removed"}
+
+
+@app.get("/user/voice-status", tags=["User"])
+async def get_voice_status(current_user: dict = Depends(get_current_user)):
+    """Return whether the user has a voice enrolled and whether voice lock is on."""
+    if pipeline is None or not hasattr(pipeline, 'mongodb_manager') or pipeline.mongodb_manager is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    user = pipeline.mongodb_manager.get_user_by_id(current_user['user_id'])
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    enrolled = bool(user.get('voice_enrolled', False))
+    settings = user.get('assistant_settings') or {}
+    lock_enabled = bool(settings.get('voice_lock_enabled', False))
+    return {"enrolled": enrolled, "lock_enabled": lock_enabled}
+
+
+@app.post("/assistant/verify-voice", tags=["Assistant"])
+async def verify_voice(
+    request: VoiceVerifyRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Compare incoming audio against the owner's stored voice embedding."""
+    if pipeline is None or not hasattr(pipeline, 'mongodb_manager') or pipeline.mongodb_manager is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    stored_b64 = pipeline.mongodb_manager.get_voice_embedding(current_user['user_id'])
+    if not stored_b64:
+        return {"authorized": True, "enrolled": False, "confidence": 1.0}
+    if not _voice_auth_available or get_embedding is None:
+        return {"authorized": True, "enrolled": True, "confidence": 1.0}
+    try:
+        audio_bytes = base64.b64decode(request.audio_base64)
+    except Exception:
+        return {"authorized": False, "enrolled": True, "confidence": 0.0}
+    incoming = get_embedding(audio_bytes)
+    if incoming is None:
+        return {"authorized": False, "enrolled": True, "confidence": 0.0}
+    stored = b64_to_embedding(stored_b64)
+    sim = cosine_similarity(incoming, stored)
+    authorized = sim >= VOICE_SIMILARITY_THRESHOLD
+    print(f"[VoiceAuth] user={current_user['user_id']} similarity={sim:.3f} authorized={authorized}")
+    return {"authorized": authorized, "enrolled": True, "confidence": round(sim, 3)}
 
 
 @app.post("/assistant/narrate", tags=["Assistant"])
@@ -926,12 +1082,10 @@ async def assistant_narrate(
     has_real_analysis = bool(analysis.get('objects') or analysis.get('face_recognition') or analysis.get('risk_assessment'))
     effective_camera_summary = camera_summary() if (live_active or has_real_analysis) else "CAMERA STATUS: Live CCTV is currently OFF — no feed is streaming. No scene data is available."
 
-    if rag_engine is not None and gemini_client is not None:
+    if gemini_client is not None and RAGEngine is not None:
         try:
-            # Refresh index if stale (every index_refresh_minutes)
-            if rag_engine.is_stale():
-                rag_engine.build_index(current_user['user_id'])
-            context_logs = rag_engine.retrieve(effective_query, k=rag_engine.top_k)
+            user_rag = _get_rag_for_user(current_user['user_id'])
+            context_logs = user_rag.retrieve(effective_query, k=user_rag.top_k)
             text = gemini_client.generate(
                 assistant_name,
                 effective_camera_summary,
@@ -1230,6 +1384,7 @@ async def analyze_image(
     file: UploadFile = File(...),
     return_annotated: bool = Form(True),  # 🎯 DEFAULT TRUE - Always return visual analysis
     camera_id: Optional[str] = Form(None),
+    skip_deepfake: bool = Form(False),  # Set True for live CCTV to skip slow deepfake model
     current_user: Optional[dict] = Depends(get_current_user_optional),
 ):
     """
@@ -1272,6 +1427,7 @@ async def analyze_image(
                 return_annotated=return_annotated,
                 user_id=user_id,
                 camera_id=camera_id,
+                skip_deepfake=skip_deepfake,
             )
         finally:
             _analyze_semaphore.release()
@@ -1336,7 +1492,35 @@ async def analyze_image(
         
         # Convert numpy types to Python types for JSON serialization
         result = convert_numpy_types(result)
-        
+
+        # ── Log detection to MongoDB so RAG has history to retrieve ──────────
+        if user_id and hasattr(pipeline, 'mongodb_manager') and pipeline.mongodb_manager and pipeline.mongodb_manager.is_connected:
+            try:
+                risk    = result.get('risk_assessment') or {}
+                face    = result.get('face_recognition') or {}
+                deepfk  = result.get('deepfake_detection') or {}
+                identity = (face.get('identity') or '').strip()
+                detected_identities = [identity] if identity and identity.lower() not in {'unknown', 'n/a', ''} else []
+                unknown_faces = 1 if (face.get('faces_detected') and not detected_identities) else 0
+                log_doc = {
+                    'camera_location': camera_id or ('Live CCTV' if skip_deepfake else 'Image Upload'),
+                    'detected_identities': detected_identities,
+                    'unknown_faces': unknown_faces,
+                    'deepfake_detected': bool(deepfk.get('is_fake') or deepfk.get('is_deepfake')),
+                    'deepfake_confidence': float(deepfk.get('fake_probability') or deepfk.get('confidence') or 0.0),
+                    'suspicious_objects': result.get('suspicious_objects') or [],
+                    'risk_level': str(risk.get('risk_level') or 'LOW').lower(),
+                    'risk_score': float(risk.get('overall_score') or 0.0),
+                }
+                doc_id = pipeline.mongodb_manager.log_detection(user_id, log_doc)
+                # Live-update that user's RAG index so queries already see this frame
+                if doc_id not in {'offline', 'error'} and user_id in rag_engines:
+                    log_doc['timestamp'] = __import__('datetime').datetime.utcnow()
+                    log_doc['user_id'] = user_id
+                    rag_engines[user_id].add_log(log_doc)
+            except Exception as _log_err:
+                print(f"[Detection Log] failed: {_log_err}")
+
         print(f"📤 Sending response with {len(result)} keys")
         print(f"   Has annotated_image in final response: {'annotated_image' in result}")
         print(f"{'='*60}\n")
@@ -1352,7 +1536,8 @@ async def analyze_video(
     file: UploadFile = File(...),
     frame_skip: int = Form(5),
     return_annotated_video: bool = Form(False),
-    weapon_detection_only: bool = Form(False)
+    weapon_detection_only: bool = Form(False),
+    current_user: Optional[dict] = Depends(get_current_user_optional),
 ):
     """
     Analyze an uploaded video file with weapon detection.
@@ -1520,6 +1705,41 @@ async def analyze_video(
 
         # Note: Per project constraint, we do not delete temp files here.
         # temp_path/output_video_path are left on disk.
+
+        # ── Log each processed frame to MongoDB so RAG has video history ────
+        user_id = (current_user or {}).get('user_id')
+        if user_id and hasattr(pipeline, 'mongodb_manager') and pipeline.mongodb_manager and pipeline.mongodb_manager.is_connected:
+            import datetime as _dt
+            logged = 0
+            for r in results:
+                try:
+                    frame_num = r.get('frame_number', 0)
+                    ts_offset = frame_num / fps if fps > 0 else 0
+                    risk    = r.get('risk_assessment') or {}
+                    face    = r.get('face_recognition') or {}
+                    deepfk  = r.get('deepfake') or r.get('deepfake_detection') or {}
+                    identity = (face.get('identity') or '').strip()
+                    detected_identities = [identity] if identity and identity.lower() not in {'unknown', 'n/a', 'no face', ''} else []
+                    unknown_faces = 1 if (face.get('face_detected') and not detected_identities) else 0
+                    log_doc = {
+                        'camera_location': f'Video Upload ({file.filename}) @{ts_offset:.1f}s',
+                        'detected_identities': detected_identities,
+                        'unknown_faces': unknown_faces,
+                        'deepfake_detected': bool(deepfk.get('is_fake') or deepfk.get('is_deepfake')),
+                        'deepfake_confidence': float(deepfk.get('fake_probability') or deepfk.get('confidence') or 0.0),
+                        'suspicious_objects': r.get('suspicious_objects') or [],
+                        'risk_level': str(risk.get('risk_level') or 'LOW').lower(),
+                        'risk_score': float(risk.get('overall_score') or 0.0),
+                    }
+                    doc_id = pipeline.mongodb_manager.log_detection(user_id, log_doc)
+                    if doc_id not in {'offline', 'error'} and user_id in rag_engines:
+                        log_doc['timestamp'] = _dt.datetime.utcnow()
+                        log_doc['user_id'] = user_id
+                        rag_engines[user_id].add_log(log_doc)
+                    logged += 1
+                except Exception as _log_err:
+                    print(f"[Video Log] frame {r.get('frame_number')} failed: {_log_err}")
+            print(f"[Video Log] Saved {logged}/{len(results)} frame detections to MongoDB")
         
         print(f"\n📊 Analysis Complete:")
         print(f"   Frames processed: {len(results)}")
@@ -1527,8 +1747,29 @@ async def analyze_video(
         print(f"   Frames with weapons: {frames_with_weapons}")
         print(f"{'='*60}\n")
         
+        # Calculate final video risk level
+        final_risk_level = "LOW"
+        
+        # Check for weapons (highest priority) → HIGH
+        if total_weapons > 0 or (deepfake_summary and deepfake_summary.get('label') == 'FAKE'):
+            final_risk_level = "HIGH"
+        else:
+            # Check frame-level risk levels
+            high_risk_count = sum(1 for r in results if r.get('risk_assessment', {}).get('risk_level') == 'HIGH')
+            medium_risk_count = sum(1 for r in results if r.get('risk_assessment', {}).get('risk_level') == 'MEDIUM')
+            
+            if high_risk_count > 0:
+                final_risk_level = "HIGH"
+            elif medium_risk_count > 0:
+                final_risk_level = "MEDIUM"
+        
+        print(f"   Final Risk Level: {final_risk_level}")
+        print(f"   High Risk Frames: {sum(1 for r in results if r.get('risk_assessment', {}).get('risk_level') == 'HIGH')}")
+        print(f"   Medium Risk Frames: {sum(1 for r in results if r.get('risk_assessment', {}).get('risk_level') == 'MEDIUM')}")
+        
         response = {
             "num_frames_processed": len(results),
+            "final_risk_level": final_risk_level,
             "weapon_summary": weapon_summary,
             "weapon_detections": dict(weapon_detections),
             "deepfake_summary": deepfake_summary,
@@ -1581,8 +1822,8 @@ async def add_face(
         contents = await file.read()
         image = decode_image(contents)
         
-        # Add to database
-        success = pipeline.face_recognizer.add_identity(image, name)
+        # Add to database — pass current user's ID so face is stored under their account
+        success = pipeline.face_recognizer.add_identity(image, name, user_id=current_user['user_id'])
         
         if success:
             return {
@@ -1597,7 +1838,7 @@ async def add_face(
 
 
 @app.get("/face/list", tags=["Face Database"])
-async def list_faces(detailed: bool = True):
+async def list_faces(detailed: bool = True, current_user: dict = Depends(get_current_user)):
     """
     Get list of all identities in the database.
     
@@ -1610,7 +1851,7 @@ async def list_faces(detailed: bool = True):
     if pipeline is None:
         raise HTTPException(status_code=503, detail="Pipeline not initialized")
     
-    identities = pipeline.face_recognizer.list_identities(detailed=detailed)
+    identities = pipeline.face_recognizer.list_identities(detailed=detailed, user_id=current_user['user_id'])
     
     # If detailed, encode photos as base64
     if detailed and isinstance(identities, list) and len(identities) > 0:
@@ -1634,7 +1875,7 @@ async def list_faces(detailed: bool = True):
 
 
 @app.delete("/face/{name}", tags=["Face Database"])
-async def remove_face(name: str):
+async def remove_face(name: str, current_user: dict = Depends(get_current_user)):
     """
     Remove an identity from the database.
     
@@ -1647,7 +1888,7 @@ async def remove_face(name: str):
     if pipeline is None:
         raise HTTPException(status_code=503, detail="Pipeline not initialized")
     
-    success = pipeline.face_recognizer.remove_identity(name)
+    success = pipeline.face_recognizer.remove_identity(name, user_id=current_user['user_id'])
     
     if success:
         return {

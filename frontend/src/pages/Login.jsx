@@ -117,8 +117,8 @@ export default function Login() {
             <Shield className="w-6 h-6 text-white" />
           </motion.div>
           <div>
-            <p className="text-white font-bold text-xl leading-none">VisionGuard</p>
-            <p className="text-blue-400 text-xs font-semibold tracking-widest uppercase">AI Security</p>
+            <p style={{ fontFamily: "'Dancing Script', cursive", fontWeight: 700 }} className="text-white text-xl leading-none">VisionGuard AI</p>
+            <p className="text-blue-400 text-xs font-semibold tracking-widest uppercase">Security Platform</p>
           </div>
         </div>
 
@@ -193,7 +193,7 @@ export default function Login() {
             <div className="w-10 h-10 bg-blue-600 rounded-xl flex items-center justify-center">
               <Shield className="w-5 h-5 text-white" />
             </div>
-            <p className="text-white font-bold text-xl">VisionGuard AI</p>
+            <p style={{ fontFamily: "'Dancing Script', cursive", fontSize: '1.4rem', fontWeight: 700 }} className="text-white">VisionGuard AI</p>
           </div>
 
           <div className="mb-8">

@@ -45,7 +45,7 @@ class DeepfakeDetector:
     Uses pretrained models from Hugging Face for easy deployment.
     """
     
-    def __init__(self, model_name: str = "dima806/deepfake_vs_real_image_detection", threshold: float = 0.35, gemini_api_key: str = None):
+    def __init__(self, model_name: str = "dima806/deepfake_vs_real_image_detection", threshold: float = 0.35, gemini_api_key: str = None, gemini_model_name: str = "gemini-2.0-flash"):
         """
         Initialize the deepfake detector with a pretrained model.
         
@@ -81,8 +81,8 @@ class DeepfakeDetector:
             if gemini_api_key and GEMINI_AVAILABLE:
                 try:
                     genai.configure(api_key=gemini_api_key)
-                    self.gemini_model = genai.GenerativeModel('gemini-1.5-flash')
-                    print("✅ Gemini API fallback initialized")
+                    self.gemini_model = genai.GenerativeModel(gemini_model_name)
+                    print(f"✅ Gemini API fallback initialized ({gemini_model_name})")
                 except Exception as e:
                     print(f"⚠️ Gemini fallback initialization failed: {e}")
                     self.gemini_model = None
@@ -282,8 +282,11 @@ Respond STRICTLY in JSON with two fields:
 Example: {"label":"FAKE","confidence":92}
 """
             
-            # Send to Gemini
-            response = self.gemini_model.generate_content([prompt, image_pil])
+            # Send to Gemini — 10 s timeout so a dropped connection fails fast
+            response = self.gemini_model.generate_content(
+                [prompt, image_pil],
+                request_options={"timeout": 10}
+            )
             result_text = response.text.strip()
 
             # Parse JSON-like response

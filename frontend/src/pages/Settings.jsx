@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+﻿import { useState, useEffect } from 'react';
 import { motion } from 'framer-motion';
 import { Settings as SettingsIcon, MessageCircle, Save, AlertCircle, CheckCircle, HelpCircle, ExternalLink, Eye, EyeOff, Send } from 'lucide-react';
 import authService from '../services/authService';
@@ -16,8 +16,11 @@ function Settings() {
     enabled: false,
     name: 'Jarvis',
     voice: 'male',
-    web_control_enabled: false
+    web_control_enabled: false,
+    voice_lock_enabled: false,
   });
+  const [voiceEnrolled, setVoiceEnrolled]   = useState(false);
+  const [enrollStatus, setEnrollStatus]     = useState(null);
   const [loading, setLoading] = useState(false);
   const [saveStatus, setSaveStatus] = useState(null);
   const [assistantLoading, setAssistantLoading] = useState(false);
@@ -58,8 +61,10 @@ function Settings() {
             enabled: !!response.data.settings.enabled,
             name: response.data.settings.name || 'Jarvis',
             voice: response.data.settings.voice || 'male',
-            web_control_enabled: !!response.data.settings.web_control_enabled
+            web_control_enabled: !!response.data.settings.web_control_enabled,
+            voice_lock_enabled: !!response.data.settings.voice_lock_enabled,
           });
+          setVoiceEnrolled(!!response.data.settings.voice_enrolled);
         }
       } catch (error) {
         console.error('Failed to fetch assistant settings:', error);
@@ -83,7 +88,7 @@ function Settings() {
     setAssistantSettings(updated);
 
     // Auto-save on toggle changes to match Telegram UX
-    if (name === 'enabled' || name === 'voice' || name === 'web_control_enabled') {
+    if (name === 'enabled' || name === 'voice' || name === 'web_control_enabled' || name === 'voice_lock_enabled') {
       saveAssistantSettingsToBackend(updated);
     }
   };
@@ -98,7 +103,8 @@ function Settings() {
         enabled: !!settings.enabled,
         name: 'Jarvis',
         voice: settings.voice || 'male',
-        web_control_enabled: !!settings.web_control_enabled
+        web_control_enabled: !!settings.web_control_enabled,
+        voice_lock_enabled: !!settings.voice_lock_enabled,
       };
       await axios.put('/user/assistant-settings', payload);
 
@@ -136,10 +142,25 @@ function Settings() {
       enabled: !!assistantSettings.enabled,
       name: 'Jarvis',
       voice: assistantSettings.voice || 'male',
-      web_control_enabled: !!assistantSettings.web_control_enabled
+      web_control_enabled: !!assistantSettings.web_control_enabled,
+      voice_lock_enabled: !!assistantSettings.voice_lock_enabled,
     };
 
     await saveAssistantSettingsToBackend(payload);
+  };
+
+  const handleRemoveVoice = async () => {
+    if (!window.confirm('Remove voice enrollment? Voice Lock will be disabled.')) return;
+    try {
+      const axios = authService.getAuthAxios();
+      await axios.delete('/user/enroll-voice');
+      setVoiceEnrolled(false);
+      setAssistantSettings(s => ({ ...s, voice_lock_enabled: false }));
+      setEnrollStatus({ type: 'success', message: 'Voice enrollment removed.' });
+    } catch {
+      setEnrollStatus({ type: 'error', message: 'Failed to remove voice enrollment.' });
+    }
+    setTimeout(() => setEnrollStatus(null), 4000);
   };
 
   const handleChange = (e) => {
@@ -261,13 +282,13 @@ function Settings() {
         animate={{ opacity: 1, y: 0 }}
         className="mb-8"
       >
-        <h1 className="text-3xl font-bold text-gray-900 flex items-center gap-3">
+        <h1 className="text-3xl font-bold text-white flex items-center gap-3">
           <div className="p-3 bg-gradient-to-br from-purple-500 to-pink-500 rounded-xl">
             <SettingsIcon className="w-8 h-8 text-white" />
           </div>
           Account Settings
         </h1>
-        <p className="text-gray-600 mt-2">
+        <p className="text-slate-400 mt-2">
           Configure your Telegram notifications and preferences
         </p>
       </motion.div>
@@ -314,23 +335,23 @@ function Settings() {
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ delay: 0.1 }}
-          className="bg-white rounded-2xl shadow-lg p-6"
+          className="bg-[#060c18] rounded-2xl border border-slate-800/60 p-6"
         >
-          <h2 className="text-xl font-semibold text-gray-900 mb-4">
+          <h2 className="text-xl font-semibold text-white mb-4">
             Account Information
           </h2>
           <div className="space-y-3">
-            <div className="flex justify-between py-2 border-b border-gray-100">
-              <span className="text-gray-600">Full Name</span>
-              <span className="font-medium text-gray-900">{user?.full_name}</span>
+            <div className="flex justify-between py-2 border-b border-slate-700/50">
+              <span className="text-slate-400">Full Name</span>
+              <span className="font-medium text-white">{user?.full_name}</span>
             </div>
-            <div className="flex justify-between py-2 border-b border-gray-100">
-              <span className="text-gray-600">Email</span>
-              <span className="font-medium text-gray-900">{user?.email}</span>
+            <div className="flex justify-between py-2 border-b border-slate-700/50">
+              <span className="text-slate-400">Email</span>
+              <span className="font-medium text-white">{user?.email}</span>
             </div>
             <div className="flex justify-between py-2">
-              <span className="text-gray-600">User ID</span>
-              <span className="font-mono text-sm text-gray-500">{user?.user_id}</span>
+              <span className="text-slate-400">User ID</span>
+              <span className="font-mono text-sm text-slate-500">{user?.user_id}</span>
             </div>
           </div>
         </motion.div>
@@ -340,25 +361,25 @@ function Settings() {
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ delay: 0.2 }}
-          className="bg-white rounded-2xl shadow-lg p-6"
-        >
+          className="bg-[#060c18] rounded-2xl border border-slate-800/60 p-6"
+            > 
           <div className="flex items-center justify-between mb-6">
             <div className="flex items-center gap-3">
-              <div className="p-2 bg-blue-100 rounded-lg">
-                <MessageCircle className="w-6 h-6 text-blue-600" />
+              <div className="p-2 bg-blue-900/30 rounded-lg">
+                <MessageCircle className="w-6 h-6 text-blue-400" />
               </div>
               <div>
-                <h2 className="text-xl font-semibold text-gray-900">
+                <h2 className="text-xl font-semibold text-white">
                   Telegram Notifications
                 </h2>
-                <p className="text-sm text-gray-600">
+                <p className="text-sm text-slate-400">
                   Receive alerts for unknown face detections
                 </p>
               </div>
             </div>
             <button
               onClick={() => setShowTutorial(!showTutorial)}
-              className="flex items-center gap-2 px-4 py-2 text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"
+              className="flex items-center gap-2 px-4 py-2 text-blue-400 hover:bg-blue-900/20 rounded-lg transition-colors"
             >
               <HelpCircle className="w-5 h-5" />
               How to setup?
@@ -371,22 +392,22 @@ function Settings() {
               initial={{ opacity: 0, height: 0 }}
               animate={{ opacity: 1, height: 'auto' }}
               exit={{ opacity: 0, height: 0 }}
-              className="mb-6 bg-blue-50 border border-blue-200 rounded-lg p-6"
+              className="mb-6 bg-blue-900/20 border border-blue-500/30 rounded-lg p-6"
             >
-              <h3 className="font-semibold text-blue-900 mb-4 flex items-center gap-2">
+              <h3 className="font-semibold text-blue-300 mb-4 flex items-center gap-2">
                 <HelpCircle className="w-5 h-5" />
                 How to Setup Telegram Bot (Step-by-Step)
               </h3>
-              <ol className="space-y-3 text-sm text-blue-900">
+              <ol className="space-y-3 text-sm text-blue-200">
                 <li className="flex gap-3">
                   <span className="flex-shrink-0 w-6 h-6 bg-blue-600 text-white rounded-full flex items-center justify-center font-bold text-xs">
                     1
                   </span>
                   <div>
                     <strong>Create a Telegram Bot:</strong>
-                    <ul className="mt-1 ml-4 space-y-1 text-blue-800">
-                      <li>• Open Telegram and search for <code className="bg-white px-2 py-0.5 rounded">@BotFather</code></li>
-                      <li>• Send <code className="bg-white px-2 py-0.5 rounded">/newbot</code> command</li>
+                    <ul className="mt-1 ml-4 space-y-1 text-blue-300">
+                      <li>• Open Telegram and search for <code className="bg-slate-800 px-2 py-0.5 rounded text-blue-200">@BotFather</code></li>
+                      <li>• Send <code className="bg-slate-800 px-2 py-0.5 rounded text-blue-200">/newbot</code> command</li>
                       <li>• Choose a name for your bot (e.g., "My VisionGuard Bot")</li>
                       <li>• Choose a username ending in "bot" (e.g., "myname_visionguard_bot")</li>
                       <li>• Copy the <strong>Bot Token</strong> you receive</li>
@@ -399,12 +420,12 @@ function Settings() {
                   </span>
                   <div>
                     <strong>Get Your Chat ID:</strong>
-                    <ul className="mt-1 ml-4 space-y-1 text-blue-800">
+                    <ul className="mt-1 ml-4 space-y-1 text-blue-300">
                       <li>• Search for your bot in Telegram</li>
                       <li>• Start a chat by clicking "Start"</li>
                       <li>• Send any message to your bot</li>
-                      <li>• Open: <a href="https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates" target="_blank" rel="noopener noreferrer" className="text-blue-600 underline">https://api.telegram.org/bot&lt;YOUR_BOT_TOKEN&gt;/getUpdates</a></li>
-                      <li>• Find <code className="bg-white px-2 py-0.5 rounded">"chat":{'{'}{"id"}:123456789{'}'}</code> in the response</li>
+                      <li>• Open: <a href="https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates" target="_blank" rel="noopener noreferrer" className="text-blue-400 underline">https://api.telegram.org/bot&lt;YOUR_BOT_TOKEN&gt;/getUpdates</a></li>
+                      <li>• Find <code className="bg-slate-800 px-2 py-0.5 rounded text-blue-200">"chat":{'{'}{"id"}:123456789{'}'}</code> in the response</li>
                       <li>• Copy your Chat ID (the number)</li>
                     </ul>
                   </div>
@@ -415,7 +436,7 @@ function Settings() {
                   </span>
                   <div>
                     <strong>Enter Settings Below:</strong>
-                    <ul className="mt-1 ml-4 space-y-1 text-blue-800">
+                    <ul className="mt-1 ml-4 space-y-1 text-blue-300">
                       <li>• Paste your Bot Token in "Bot Token" field</li>
                       <li>• Paste your Chat ID in "Chat ID" field</li>
                       <li>• Enable notifications</li>
@@ -424,12 +445,12 @@ function Settings() {
                   </div>
                 </li>
               </ol>
-              <div className="mt-4 pt-4 border-t border-blue-300">
+              <div className="mt-4 pt-4 border-t border-blue-500/30">
                 <a
                   href="https://core.telegram.org/bots"
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="text-blue-600 hover:text-blue-700 flex items-center gap-2 text-sm font-medium"
+                  className="text-blue-400 hover:text-blue-300 flex items-center gap-2 text-sm font-medium"
                 >
                   <ExternalLink className="w-4 h-4" />
                   Official Telegram Bot Documentation
@@ -445,8 +466,8 @@ function Settings() {
               animate={{ opacity: 1, y: 0 }}
               className={`mb-4 px-4 py-3 rounded-lg flex items-center gap-2 ${
                 saveStatus.type === 'success'
-                  ? 'bg-green-50 border border-green-200 text-green-700'
-                  : 'bg-red-50 border border-red-200 text-red-700'
+                  ? 'bg-green-900/20 border border-green-500/30 text-green-300'
+                  : 'bg-red-900/20 border border-red-500/30 text-red-300'
               }`}
             >
               {saveStatus.type === 'success' ? (
@@ -460,17 +481,17 @@ function Settings() {
 
           <div className="space-y-6">
             {/* Enable Toggle */}
-            <div className="flex items-center justify-between p-4 bg-gray-50 rounded-lg">
+            <div className="flex items-center justify-between p-4 bg-slate-800/30 rounded-lg">
               <div>
-                <h3 className="font-medium text-gray-900 flex items-center gap-2">
+                <h3 className="font-medium text-white flex items-center gap-2">
                   Enable Telegram Notifications
                   {telegramSettings.enabled && (
-                    <span className="px-2 py-0.5 bg-green-100 text-green-700 text-xs font-semibold rounded-full">
+                    <span className="px-2 py-0.5 bg-green-900/40 text-green-300 text-xs font-semibold rounded-full">
                       ACTIVE
                     </span>
                   )}
                 </h3>
-                <p className="text-sm text-gray-600 mt-1">
+                <p className="text-sm text-slate-400 mt-1">
                   {telegramSettings.enabled 
                     ? '✅ Active! You will receive Telegram alerts for unknown faces'
                     : '⚠️ 1. Fill Bot Token & Chat ID below → 2. Toggle ON → 3. Click Save'
@@ -489,12 +510,12 @@ function Settings() {
               </label>
             </div>
 
-            {/* Bot Token - Only visible when toggle is on */}
-            {(telegramSettings.enabled || telegramSettings.bot_token) && (
+            {/* Bot Token */}
+            {(
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-2">
+              <label className="block text-sm font-medium text-slate-300 mb-2">
                 Bot Token
-                <span className="text-red-500">*</span>
+                <span className="text-red-400">*</span>
               </label>
               <div className="relative">
                 <input
@@ -503,28 +524,28 @@ function Settings() {
                   value={telegramSettings.bot_token || ''}
                   onChange={handleChange}
                   placeholder="••••••••••••••••••••••••••••••"
-                  className="w-full px-4 py-3 pr-12 bg-gray-50 border border-gray-200 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent font-mono text-sm"
+                  className="w-full px-4 py-3 pr-12 bg-[#091220] border border-slate-700/50 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent font-mono text-sm text-white"
                 />
                 <button
                   type="button"
                   onClick={() => setShowBotToken(!showBotToken)}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-700 focus:outline-none"
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-200 focus:outline-none"
                 >
                   {showBotToken ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
                 </button>
               </div>
-              <p className="text-xs text-gray-500 mt-1">
+              <p className="text-xs text-slate-500 mt-1">
                 Get this from @BotFather on Telegram
               </p>
             </div>
             )}
 
-            {/* Chat ID - Only visible when toggle is on */}
-            {(telegramSettings.enabled || telegramSettings.chat_id) && (
+            {/* Chat ID */}
+            {(
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-2">
+              <label className="block text-sm font-medium text-slate-300 mb-2">
                 Chat ID
-                <span className="text-red-500">*</span>
+                <span className="text-red-400">*</span>
               </label>
               <div className="relative">
                 <input
@@ -533,101 +554,77 @@ function Settings() {
                   value={telegramSettings.chat_id || ''}
                   onChange={handleChange}
                   placeholder="••••••••••"
-                  className="w-full px-4 py-3 pr-12 bg-gray-50 border border-gray-200 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent font-mono text-sm"
+                  className="w-full px-4 py-3 pr-12 bg-[#091220] border border-slate-700/50 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent font-mono text-sm text-white"
                 />
                 <button
                   type="button"
                   onClick={() => setShowChatId(!showChatId)}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-700 focus:outline-none"
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-200 focus:outline-none"
                 >
                   {showChatId ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
                 </button>
               </div>
-              <p className="text-xs text-gray-500 mt-1">
+              <p className="text-xs text-slate-500 mt-1">
                 Your personal Telegram chat ID (numeric)
               </p>
             </div>
             )}
 
-            {/* Advanced Settings */}
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">
-                  Cooldown Minutes
-                </label>
-                <input
-                  type="number"
-                  name="cooldown_minutes"
-                  value={telegramSettings.cooldown_minutes}
-                  onChange={handleChange}
-                  min="1"
-                  max="60"
-                  className="w-full px-4 py-3 bg-gray-50 border border-gray-200 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                />
-                <p className="text-xs text-gray-500 mt-1">
-                  Wait time before re-notifying same face
-                </p>
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">
-                  Retention Days
-                </label>
-                <input
-                  type="number"
-                  name="retention_days"
-                  value={telegramSettings.retention_days}
-                  onChange={handleChange}
-                  min="1"
-                  max="365"
-                  className="w-full px-4 py-3 bg-gray-50 border border-gray-200 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                />
-                <p className="text-xs text-gray-500 mt-1">
-                  Keep unknown face images for X days
-                </p>
-              </div>
-            </div>
-
             {/* Action Buttons */}
-            <div className="grid grid-cols-2 gap-4">
+            <div className={`pt-3 flex flex-col gap-3`}>
+              {/* Save Button */}
+              <button
+                onClick={handleSave}
+                disabled={loading}
+                className="group relative w-full overflow-hidden rounded-2xl p-px active:scale-[0.98] transition-transform duration-150 disabled:opacity-50 disabled:cursor-not-allowed focus:outline-none"
+              >
+                {/* Animated gradient border */}
+                <span className="absolute inset-0 rounded-2xl bg-gradient-to-r from-blue-500 via-violet-500 to-cyan-400 opacity-80 group-hover:opacity-100 transition-opacity duration-300" />
+                {/* Inner fill */}
+                <span className="relative flex items-center justify-center gap-2.5 w-full py-3.5 px-6 rounded-2xl bg-[#0a1628] group-hover:bg-[#0c1a30] transition-colors duration-200">
+                  {loading ? (
+                    <>
+                      <div className="w-4 h-4 border-2 border-blue-400 border-t-transparent rounded-full animate-spin" />
+                      <span className="text-sm font-semibold text-blue-200 tracking-wide">Saving changes…</span>
+                    </>
+                  ) : (
+                    <>
+                      <Save className="w-4 h-4 text-blue-300 group-hover:text-white transition-colors duration-200" />
+                      <span className="text-sm font-semibold bg-gradient-to-r from-blue-300 via-violet-300 to-cyan-300 bg-clip-text text-transparent group-hover:from-white group-hover:via-white group-hover:to-white transition-all duration-200">
+                        Apply Changes
+                      </span>
+                    </>
+                  )}
+                </span>
+              </button>
+
               {/* Test Notification Button */}
               {telegramSettings.enabled && (
                 <button
                   onClick={handleTestNotification}
                   disabled={testing || loading}
-                  className="bg-green-600 text-white py-3 rounded-lg font-medium hover:bg-green-700 focus:ring-4 focus:ring-green-200 transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+                  className="group relative w-full overflow-hidden rounded-2xl p-px active:scale-[0.98] transition-transform duration-150 disabled:opacity-50 disabled:cursor-not-allowed focus:outline-none"
                 >
-                  {testing ? (
-                    <>
-                      <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                      Testing...
-                    </>
-                  ) : (
-                    <>
-                      <Send className="w-5 h-5" />
-                      Test Notification
-                    </>
-                  )}
+                  {/* Gradient border */}
+                  <span className="absolute inset-0 rounded-2xl bg-gradient-to-r from-emerald-500 via-teal-400 to-green-400 opacity-60 group-hover:opacity-90 transition-opacity duration-300" />
+                  {/* Inner fill */}
+                  <span className="relative flex items-center justify-center gap-2.5 w-full py-3 px-6 rounded-2xl bg-[#0a1628] group-hover:bg-[#091f18] transition-colors duration-200">
+                    {testing ? (
+                      <>
+                        <div className="w-4 h-4 border-2 border-emerald-400 border-t-transparent rounded-full animate-spin" />
+                        <span className="text-sm font-semibold text-emerald-300 tracking-wide">Firing off message…</span>
+                      </>
+                    ) : (
+                      <>
+                        <Send className="w-4 h-4 text-emerald-400 group-hover:text-white transition-colors duration-200" />
+                        <span className="text-sm font-semibold bg-gradient-to-r from-emerald-300 to-teal-300 bg-clip-text text-transparent group-hover:from-white group-hover:to-white transition-all duration-200">
+                          Ping My Telegram
+                        </span>
+                      </>
+                    )}
+                  </span>
                 </button>
               )}
-              
-              {/* Save Button */}
-              <button
-                onClick={handleSave}
-                disabled={loading}
-                className={`${telegramSettings.enabled ? '' : 'col-span-2'} bg-gradient-to-r from-blue-600 to-purple-600 text-white py-3 rounded-lg font-medium hover:from-blue-700 hover:to-purple-700 focus:ring-4 focus:ring-blue-200 transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2`}
-              >
-                {loading ? (
-                  <>
-                    <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                    Saving...
-                  </>
-                ) : (
-                  <>
-                    <Save className="w-5 h-5" />
-                    Save Settings
-                  </>
-                )}
-              </button>
             </div>
           </div>
         </motion.div>
@@ -637,15 +634,14 @@ function Settings() {
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ delay: 0.25 }}
-          className="bg-white rounded-2xl shadow-lg p-6"
+          className="bg-[#060c18] rounded-2xl border border-slate-800/60 p-6"
         >
           <div className="flex items-center gap-3 mb-2">
-            <div className="p-2 bg-purple-100 rounded-lg">
-              <SettingsIcon className="w-6 h-6 text-purple-600" />
+            <div className="p-2 bg-purple-900/30 rounded-lg">
+              <SettingsIcon className="w-6 h-6 text-purple-400" />
             </div>
             <div>
-              <h2 className="text-xl font-semibold text-gray-900">AI Assistant</h2>
-              <p className="text-sm text-gray-600">Enable and name your surveillance assistant</p>
+              <h2 className="text-xl font-semibold text-white">AI Assistant</h2>
             </div>
           </div>
 
@@ -656,8 +652,8 @@ function Settings() {
               animate={{ opacity: 1, y: 0 }}
               className={`mt-4 mb-4 px-4 py-3 rounded-lg flex items-center gap-2 ${
                 assistantSaveStatus.type === 'success'
-                  ? 'bg-green-50 border border-green-200 text-green-700'
-                  : 'bg-red-50 border border-red-200 text-red-700'
+                  ? 'bg-green-900/20 border border-green-500/30 text-green-300'
+                  : 'bg-red-900/20 border border-red-500/30 text-red-300'
               }`}
             >
               {assistantSaveStatus.type === 'success' ? (
@@ -671,17 +667,17 @@ function Settings() {
 
           <div className="space-y-6">
             {/* Enable Toggle */}
-            <div className="flex items-center justify-between p-4 bg-gray-50 rounded-lg">
+            <div className="flex items-center justify-between p-4 bg-slate-800/30 rounded-lg">
               <div>
-                <h3 className="font-medium text-gray-900 flex items-center gap-2">
+                <h3 className="font-medium text-white flex items-center gap-2">
                   Enable AI Assistant
                   {assistantSettings.enabled && (
-                    <span className="px-2 py-0.5 bg-green-100 text-green-700 text-xs font-semibold rounded-full">
+                    <span className="px-2 py-0.5 bg-green-900/40 text-green-300 text-xs font-semibold rounded-full">
                       ACTIVE
                     </span>
                   )}
                 </h3>
-                <p className="text-sm text-gray-600 mt-1">
+                <p className="text-sm text-slate-400 mt-1">
                   {assistantSettings.enabled
                     ? '✅ Active! Jarvis features can speak and narrate alerts'
                     : 'Turn this ON to enable Jarvis-style narration'
@@ -700,28 +696,28 @@ function Settings() {
               </label>
             </div>
 
-            <p className="text-sm text-gray-700">
-              Wake phrase: <span className="font-semibold">Hey Jarvis</span>
+            <p className="text-sm text-slate-300">
+              Wake phrase: <span className="font-semibold text-white">Hey Jarvis</span>
             </p>
 
             {/* Web Control Toggle */}
-            <div className="flex items-center justify-between p-4 bg-gray-50 rounded-lg border border-purple-100">
+            <div className="flex items-center justify-between p-4 bg-slate-800/30 rounded-lg border border-purple-500/20">
               <div>
-                <h3 className="font-medium text-gray-900 flex items-center gap-2">
+                <h3 className="font-medium text-white flex items-center gap-2">
                   Web Control Mode
                   {assistantSettings.web_control_enabled && (
-                    <span className="px-2 py-0.5 bg-purple-100 text-purple-700 text-xs font-semibold rounded-full">
+                    <span className="px-2 py-0.5 bg-purple-900/40 text-purple-300 text-xs font-semibold rounded-full">
                       ACTIVE
                     </span>
                   )}
                 </h3>
-                <p className="text-sm text-gray-600 mt-1">
+                <p className="text-sm text-slate-400 mt-1">
                   {assistantSettings.web_control_enabled
                     ? '✅ Jarvis can navigate pages, start Live CCTV, and control the UI with your voice'
                     : 'Enable to let Jarvis navigate pages and control features via voice commands'
                   }
                 </p>
-                <p className="text-xs text-gray-400 mt-1">
+                <p className="text-xs text-slate-500 mt-1">
                   Example: "Go to Live CCTV", "Open Settings", "Start live monitoring"
                 </p>
               </div>
@@ -736,58 +732,89 @@ function Settings() {
                 <div className="relative w-14 h-8 bg-gray-300 peer-focus:ring-4 peer-focus:ring-purple-300 rounded-full peer peer-checked:after:translate-x-full rtl:peer-checked:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[4px] after:start-[4px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-6 after:w-6 after:transition-all peer-checked:bg-purple-600"></div>
               </label>
             </div>
-
-            {/* Voice Preference */}
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-2">
-                Voice
-              </label>
-              <div className="flex items-center gap-4">
-                <label className="flex items-center gap-2 text-sm text-gray-700">
+            {/* Voice Lock */}
+            <div className="space-y-3">
+              <div className="flex items-center justify-between p-4 bg-slate-800/30 rounded-lg border border-purple-500/20">
+                <div>
+                  <h3 className="font-medium text-white flex items-center gap-2">
+                    🔒 Voice Lock
+                    {assistantSettings.voice_lock_enabled && (
+                      <span className="px-2 py-0.5 bg-purple-900/40 text-purple-300 text-xs font-semibold rounded-full">ON</span>
+                    )}
+                  </h3>
+                  <p className="text-sm text-slate-400 mt-1">
+                    {assistantSettings.voice_lock_enabled
+                      ? 'Jarvis will only respond to your registered voice'
+                      : 'When ON, Jarvis verifies your voice before responding'}
+                  </p>
+                  {!voiceEnrolled && assistantSettings.voice_lock_enabled && (
+                    <p className="text-xs text-amber-400 mt-1">⚠️ No voice enrolled — register first</p>
+                  )}
+                </div>
+                <label className="relative inline-flex items-center cursor-pointer ml-4 flex-shrink-0">
                   <input
-                    type="radio"
-                    name="voice"
-                    value="male"
-                    checked={assistantSettings.voice === 'male'}
+                    type="checkbox"
+                    name="voice_lock_enabled"
+                    checked={assistantSettings.voice_lock_enabled}
                     onChange={handleAssistantChange}
-                    className="text-purple-600 focus:ring-purple-500"
+                    className="sr-only peer"
                   />
-                  Male
-                </label>
-                <label className="flex items-center gap-2 text-sm text-gray-700">
-                  <input
-                    type="radio"
-                    name="voice"
-                    value="female"
-                    checked={assistantSettings.voice === 'female'}
-                    onChange={handleAssistantChange}
-                    className="text-purple-600 focus:ring-purple-500"
-                  />
-                  Female
+                  <div className="relative w-14 h-8 bg-gray-300 peer-focus:ring-4 peer-focus:ring-purple-300 rounded-full peer peer-checked:after:translate-x-full rtl:peer-checked:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[4px] after:start-[4px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-6 after:w-6 after:transition-all peer-checked:bg-purple-600"></div>
                 </label>
               </div>
-              <p className="text-xs text-gray-500 mt-1">
-                Uses installed Windows voices. If the chosen voice isn’t available, it falls back automatically.
-              </p>
-            </div>
 
-            {/* Save Button */}
+              {/* Owner voice enrollment status */}
+              <div className="p-4 bg-slate-800/20 rounded-lg border border-slate-700/40">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-sm font-medium text-slate-300">Owner Voice</p>
+                    {voiceEnrolled
+                      ? <p className="text-xs text-green-400 mt-0.5">✅ Voice registered</p>
+                      : <p className="text-xs text-slate-500 mt-0.5">⚠️ No voice registered yet</p>
+                    }
+                  </div>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => { window.location.href = '/voice-setup' }}
+                      className="px-3 py-1.5 text-xs rounded-lg bg-purple-600/20 text-purple-300 hover:bg-purple-600/30 border border-purple-500/30 transition-all"
+                    >
+                      {voiceEnrolled ? 'Re-enroll' : '+ Register Voice'}
+                    </button>
+                    {voiceEnrolled && (
+                      <button
+                        onClick={handleRemoveVoice}
+                        className="px-3 py-1.5 text-xs rounded-lg bg-red-600/20 text-red-300 hover:bg-red-600/30 border border-red-500/30 transition-all"
+                      >
+                        Remove
+                      </button>
+                    )}
+                  </div>
+                </div>
+                {enrollStatus && (
+                  <p className={`text-xs mt-2 ${enrollStatus.type === 'success' ? 'text-green-400' : 'text-red-400'}`}>
+                    {enrollStatus.message}
+                  </p>
+                )}
+              </div>
+            </div>
             <button
               onClick={handleAssistantSave}
               disabled={assistantLoading}
-              className="bg-gradient-to-r from-purple-600 to-pink-600 text-white py-3 rounded-lg font-medium hover:from-purple-700 hover:to-pink-700 focus:ring-4 focus:ring-purple-200 transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+              className="group relative w-full overflow-hidden rounded-2xl p-px mt-2 active:scale-[0.98] transition-transform duration-150 disabled:opacity-50 disabled:cursor-not-allowed focus:outline-none"
             >
-              {assistantLoading ? (
-                <>
-                  <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                  Saving...
-                </>
-              ) : (
-                <>
-                  <Save className="w-5 h-5" />
-                  Save Assistant Settings
-                </>
-              )}
+              <span className="absolute inset-0 rounded-2xl bg-gradient-to-r from-purple-500 via-pink-500 to-fuchsia-400 opacity-80 group-hover:opacity-100 transition-opacity duration-300" />
+              <span className="relative flex items-center justify-center gap-2.5 w-full py-3.5 px-6 rounded-2xl bg-[#0a1628] group-hover:bg-[#150d1e] transition-colors duration-200">
+                {assistantLoading ? (
+                  <>
+                    <div className="w-4 h-4 border-2 border-purple-400 border-t-transparent rounded-full animate-spin" />
+                    <span className="text-sm font-semibold text-purple-200 tracking-wide">Saving changes…</span>
+                  </>
+                ) : (
+                  <span className="text-sm font-semibold bg-gradient-to-r from-purple-300 via-pink-300 to-fuchsia-300 bg-clip-text text-transparent group-hover:from-white group-hover:via-white group-hover:to-white transition-all duration-200">
+                    Apply Assistant Settings
+                  </span>
+                )}
+              </span>
             </button>
           </div>
         </motion.div>

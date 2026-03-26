@@ -1,6 +1,7 @@
 ﻿import { useEffect, useRef } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import authService from '../services/authService'
+import { blobToWavBase64 } from '../utils/audioUtils'
 
 /**
  * WakeWordListener - background, always-on voice trigger.
@@ -19,12 +20,13 @@ export default function WakeWordListener() {
   const pathnameRef    = useRef(location.pathname)
   useEffect(() => { pathnameRef.current = location.pathname }, [location.pathname])
 
-  const settingsRef    = useRef({ enabled: false, name: 'Jarvis', voice: 'male' })
+  const settingsRef    = useRef({ enabled: false, name: 'Jarvis', voice: 'male', voice_lock_enabled: false, voice_enrolled: false })
   const recognitionRef = useRef(null)
   const shouldRunRef   = useRef(false)
   const pausedUntilRef = useRef(0)
   const lastWakeRef    = useRef(0)
   const startingRef    = useRef(false)
+  const jarvisOpenRef  = useRef(false)  // true while JarvisAssistant panel is open
 
   const loadSettings = async () => {
     try {
@@ -32,16 +34,59 @@ export default function WakeWordListener() {
       const res   = await axios.get('/user/assistant-settings')
       if (res.data?.settings) {
         settingsRef.current = {
-          enabled: !!res.data.settings.enabled,
-          name:    res.data.settings.name  || 'Jarvis',
-          voice:   res.data.settings.voice || 'male',
+          enabled:            !!res.data.settings.enabled,
+          name:               res.data.settings.name  || 'Jarvis',
+          voice:              res.data.settings.voice || 'male',
+          voice_lock_enabled: !!res.data.settings.voice_lock_enabled,
+          voice_enrolled:     !!res.data.settings.voice_enrolled,
         }
-        // Auto-start listening if assistant is enabled
         if (settingsRef.current.enabled) {
           setTimeout(() => startRecognition(), 800)
         }
       }
     } catch { /* ignore */ }
+  }
+
+  // Verify owner voice. Called immediately inside onresult (mic is still warm from SR).
+  // We open our MediaRecorder BEFORE stopping SR so Chrome's audio pipeline is already
+  // active — this captures the user's trailing voice instead of silence.
+  const verifyAndWake = async (inlineCommand, recognitionToStop) => {
+    let stream = null
+    let mr     = null
+    try {
+      // Open our own stream NOW while SR's internal stream is still warm
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+      mr = new MediaRecorder(stream)
+      const chunks = []
+      mr.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data) }
+      mr.start()
+
+      // Now stop SR — our recorder keeps capturing the voice tail
+      try { recognitionToStop?.stop() } catch {}
+
+      // Record for 2 seconds (captures wake-phrase tail + any continuation)
+      await new Promise(r => setTimeout(r, 2000))
+      mr.stop()
+      stream.getTracks().forEach(t => t.stop())
+      await new Promise(r => { mr.onstop = r })
+
+      const blob = new Blob(chunks, { type: mr.mimeType || 'audio/webm' })
+      const b64  = await blobToWavBase64(blob)
+
+      const axiosInst = authService.getAuthAxios()
+      const resp = await axiosInst.post('/assistant/verify-voice', { audio_base64: b64 })
+
+      if (!resp.data.enrolled || resp.data.authorized) {
+        window.dispatchEvent(new CustomEvent('visionguard:wake', { detail: { command: inlineCommand } }))
+      } else {
+        window.dispatchEvent(new CustomEvent('visionguard:auth-failed'))
+      }
+    } catch {
+      // On any error fail open — Jarvis still works
+      try { recognitionToStop?.stop() } catch {}
+      try { stream?.getTracks().forEach(t => t.stop()) } catch {}
+      window.dispatchEvent(new CustomEvent('visionguard:wake', { detail: { command: inlineCommand } }))
+    }
   }
 
   const stopRecognition = () => {
@@ -100,8 +145,14 @@ export default function WakeWordListener() {
           if (afterWake.length > 2) inlineCommand = afterWake
         }
 
-        try { window.dispatchEvent(new CustomEvent('visionguard:wake', { detail: { command: inlineCommand } })) } catch {}
-        try { recognition.stop() } catch {}
+        // Voice Lock: open mic immediately (mic is warm from SR) to capture voice tail,
+        // then stop SR and record 2s before verifying speaker identity.
+        if (settingsRef.current.voice_lock_enabled && settingsRef.current.voice_enrolled) {
+          verifyAndWake(inlineCommand, recognition)  // recognition stopped inside verifyAndWake
+        } else {
+          try { recognition.stop() } catch {}
+          try { window.dispatchEvent(new CustomEvent('visionguard:wake', { detail: { command: inlineCommand } })) } catch {}
+        }
       } catch {}
     }
 
@@ -144,9 +195,11 @@ export default function WakeWordListener() {
     const onSettings = (e) => {
       if (!e?.detail) return
       const next = {
-        enabled: !!e.detail.enabled,
-        name:    e.detail.name  || settingsRef.current.name  || 'Jarvis',
-        voice:   e.detail.voice || settingsRef.current.voice || 'male',
+        enabled:            !!e.detail.enabled,
+        name:               e.detail.name  || settingsRef.current.name  || 'Jarvis',
+        voice:              e.detail.voice || settingsRef.current.voice || 'male',
+        voice_lock_enabled: !!e.detail.voice_lock_enabled,
+        voice_enrolled:     e.detail.voice_enrolled !== undefined ? !!e.detail.voice_enrolled : settingsRef.current.voice_enrolled,
       }
       settingsRef.current = next
       if (next.enabled) startRecognition()
@@ -159,14 +212,28 @@ export default function WakeWordListener() {
         pausedUntilRef.current = Date.now() + 14000
         try { recognitionRef.current?.stop() } catch {}
       } else {
-        // Jarvis stopped speaking — RESET (not max) so wake word is available quickly
-        pausedUntilRef.current = Date.now() + 800
-        setTimeout(() => { if (settingsRef.current.enabled) startRecognition() }, 900)
+        if (jarvisOpenRef.current) {
+          // Panel still open (listen cycle) — keep SR paused so we don't compete with
+          // JarvisAssistant's own SpeechRecognition which opens 350ms from now.
+          pausedUntilRef.current = Date.now() + 30000
+        } else {
+          // Panel closed — restart wake-word detection normally
+          pausedUntilRef.current = Date.now() + 800
+          setTimeout(() => { if (settingsRef.current.enabled) startRecognition() }, 900)
+        }
       }
     }
 
+    const onJarvisOpened = () => {
+      // Jarvis panel just opened — block wake-word SR until panel closes
+      jarvisOpenRef.current  = true
+      pausedUntilRef.current = Date.now() + 999999
+      try { recognitionRef.current?.stop() } catch {}
+    }
+
     const onJarvisClosed = () => {
-      // Panel closed manually — clear any lingering pause and restart immediately
+      // Panel closed manually — unblock and restart
+      jarvisOpenRef.current  = false
       pausedUntilRef.current = Date.now() - 1
       setTimeout(() => { if (settingsRef.current.enabled) startRecognition() }, 400)
     }
@@ -174,12 +241,14 @@ export default function WakeWordListener() {
     window.addEventListener('pointerdown',                         onGesture)
     window.addEventListener('visionguard:assistant-settings',      onSettings)
     window.addEventListener('visionguard:assistant-speaking',      onSpeaking)
+    window.addEventListener('visionguard:jarvis-opened',           onJarvisOpened)
     window.addEventListener('visionguard:jarvis-closed',           onJarvisClosed)
 
     return () => {
       window.removeEventListener('pointerdown',                    onGesture)
       window.removeEventListener('visionguard:assistant-settings', onSettings)
       window.removeEventListener('visionguard:assistant-speaking', onSpeaking)
+      window.removeEventListener('visionguard:jarvis-opened',      onJarvisOpened)
       window.removeEventListener('visionguard:jarvis-closed',      onJarvisClosed)
       stopRecognition()
     }

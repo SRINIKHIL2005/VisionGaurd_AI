@@ -13,6 +13,7 @@ import VideoAnalysis from './pages/VideoAnalysis'
 import LiveCCTV from './pages/LiveCCTV'
 import FaceDatabase from './pages/FaceDatabase'
 import Settings from './pages/Settings'
+import VoiceSetup from './pages/VoiceSetup'
 
 function App() {
   return (
@@ -45,9 +46,9 @@ function App() {
                 <Mic className="w-6 h-6" />
               </motion.button>
 
-              <div className="flex min-h-screen bg-gradient-to-br from-gray-50 via-blue-50 to-purple-50">
+              <div className="flex min-h-screen bg-[#04080f]">
                 <Sidebar />
-                <main className="flex-1 ml-64 p-8">
+                <main className="flex-1 ml-64 p-8 bg-[#04080f]">
                   <motion.div
                     initial={{ opacity: 0, y: 20 }}
                     animate={{ opacity: 1, y: 0 }}
@@ -60,6 +61,7 @@ function App() {
                       <Route path="/live" element={<LiveCCTV />} />
                       <Route path="/database" element={<FaceDatabase />} />
                       <Route path="/settings" element={<Settings />} />
+                      <Route path="/voice-setup" element={<VoiceSetup />} />
                     </Routes>
                   </motion.div>
                 </main>
