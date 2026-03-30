@@ -9,6 +9,15 @@ This is the CORE module that combines:
 2. Face Recognition
 3. Object Detection
 4. Risk Scoring Algorithm
+5. Advanced Video Analytics (NEW)
+   - Heatmap generation
+   - Motion detection
+   - Crowd analysis
+   - Loitering detection
+   - Activity recognition
+   - Behavioral anomaly detection
+   - Trajectory analysis
+   - Report generation
 
 Outputs comprehensive JSON results matching the project specification.
 """
@@ -22,6 +31,7 @@ from PIL import Image
 import yaml
 from pathlib import Path
 import asyncio
+import uuid
 from collections import defaultdict
 
 # Add parent directory to path
@@ -32,6 +42,41 @@ from models.face_recognition.face_recognizer import FaceRecognizer
 from models.object_detection.yolo_detector import YOLODetector
 from utils.image_utils import draw_bbox, draw_circle, draw_text, bgr_to_rgb
 from utils.iou_tracker import IOUTracker
+
+# Import advanced video analysis modules (NEW)
+try:
+    from models.advanced_video_analysis import (
+        HeatmapGenerator, MotionDetector, CrowdAnalyzer,
+        LoiteringDetector, TrajectoryAnalyzer, BehavioralAnomalyDetector
+    )
+    ADVANCED_ANALYTICS_AVAILABLE = True
+    print("✅ Advanced analytics modules loaded successfully")
+except Exception as e:
+    print(f"⚠️ Advanced analytics modules disabled: {type(e).__name__}: {str(e)[:100]}")
+    ADVANCED_ANALYTICS_AVAILABLE = False
+
+try:
+    from models.activity_recognition import (
+        ActivityRecognizer, SuspiciousBehaviorDetector, CrowdBehaviorAnalyzer
+    )
+    ACTIVITY_RECOGNITION_AVAILABLE = True
+except ImportError as e:
+    print(f"⚠️ Activity recognition modules not available: {e}")
+    ACTIVITY_RECOGNITION_AVAILABLE = False
+
+try:
+    from models.gesture_recognizer import GestureRecognizer
+    GESTURE_RECOGNITION_AVAILABLE = True
+except Exception as e:
+    print(f"⚠️ Gesture recognition not available: {e}")
+    GESTURE_RECOGNITION_AVAILABLE = False
+
+try:
+    from models.report_generator import ReportGenerator
+    REPORT_GENERATOR_AVAILABLE = True
+except ImportError as e:
+    print(f"⚠️ Report generator not available: {e}")
+    REPORT_GENERATOR_AVAILABLE = False
 
 
 class VisionPipeline:
@@ -49,6 +94,8 @@ class VisionPipeline:
         """
         print("=" * 60)
         print("🚀 Initializing VisionGuard AI Pipeline...")
+        self.pipeline_build = "analytics-patch-2026-03-27-v3"
+        print(f"🧩 Pipeline Build: {self.pipeline_build}")
         print("=" * 60)
         
         # Load configuration
@@ -56,6 +103,9 @@ class VisionPipeline:
         
         # Initialize all modules
         self._init_modules()
+        
+        # Initialize advanced analytics modules (NEW)
+        self._init_advanced_analytics()
 
         # Per-stream state for Live CCTV
         self._stream_frame_counters = defaultdict(int)
@@ -69,7 +119,18 @@ class VisionPipeline:
         """Load configuration from YAML file"""
         if config_path and os.path.exists(config_path):
             with open(config_path, 'r', encoding='utf-8') as f:
-                return yaml.safe_load(f)
+                cfg = yaml.safe_load(f)
+
+            # Environment overrides for sensitive/runtime values.
+            gemini_key_env = os.getenv('GEMINI_API_KEY')
+            default_user_env = os.getenv('VISIONGUARD_DEFAULT_USER_ID')
+
+            if gemini_key_env is not None:
+                cfg.setdefault('models', {}).setdefault('deepfake', {})['gemini_api_key'] = gemini_key_env
+            if default_user_env is not None:
+                cfg.setdefault('mongodb', {})['default_user_id'] = default_user_env
+
+            return cfg
         
         # Default configuration
         return {
@@ -188,14 +249,70 @@ class VisionPipeline:
             weapon_confidence=weapon_confidence
         )
     
+    def _init_advanced_analytics(self):
+        """Initialize advanced video analysis modules (NEW)"""
+        if not ADVANCED_ANALYTICS_AVAILABLE:
+            print("\n⚠️ Advanced analytics modules not available")
+            self.heatmap_generator = None
+            self.motion_detector = None
+            self.crowd_analyzer = None
+            self.loitering_detector = None
+            self.trajectory_analyzer = None
+            self.anomaly_detector = None
+            return
+        
+        print("\n🆕 Initializing Advanced Video Analytics Modules...")
+        
+        # These will be initialized per-video with frame dimensions
+        self.heatmap_generator = None
+        self.motion_detector = None
+        self.crowd_analyzer = None
+        self.loitering_detector = LoiteringDetector(min_duration=5.0, position_threshold=50)
+        self.trajectory_analyzer = None
+        self.anomaly_detector = BehavioralAnomalyDetector()
+        
+        # Activity recognition
+        if ACTIVITY_RECOGNITION_AVAILABLE:
+            self.activity_recognizer = ActivityRecognizer(use_pose=True)
+            self.suspicious_behavior_detector = SuspiciousBehaviorDetector()
+            self.crowd_behavior_analyzer = CrowdBehaviorAnalyzer()
+            print("   ✅ Activity Recognition loaded")
+        else:
+            self.activity_recognizer = None
+            self.suspicious_behavior_detector = None
+            self.crowd_behavior_analyzer = None
+        
+        # Gesture recognition (for suspicious movements/gestures)
+        if GESTURE_RECOGNITION_AVAILABLE:
+            try:
+                self.gesture_recognizer = GestureRecognizer()
+                print("   ✅ Gesture Recognition loaded")
+            except Exception as e:
+                print(f"   ⚠️ Gesture Recognition failed: {e}")
+                self.gesture_recognizer = None
+        else:
+            self.gesture_recognizer = None
+        
+        # Report generator
+        if REPORT_GENERATOR_AVAILABLE:
+            self.report_generator = ReportGenerator(output_dir="./reports")
+            print("   ✅ Report Generator loaded")
+        else:
+            self.report_generator = None
+        
+        print("   ✅ Advanced Analytics initialized")
+    
     def process_image(
         self,
         image: Union[str, np.ndarray, Image.Image],
         return_annotated: bool = True,
         user_id: Optional[str] = None,
         camera_id: Optional[str] = None,
-        skip_deepfake: bool = False,        is_video_frame: bool = False,
-        is_first_video_frame: bool = False,    ) -> Dict:
+        skip_deepfake: bool = False,
+        is_video_frame: bool = False,
+        is_first_video_frame: bool = False,
+        skip_gemini: bool = False,
+    ) -> Dict:
         """
         Process a single image through the complete pipeline.
         
@@ -246,7 +363,7 @@ class VisionPipeline:
         if skip_deepfake:
             # Skip for live CCTV — too slow for real-time and meaningless on webcam frames
             deepfake_result = {
-                'label': 'REAL', 'confidence': 0.0, 'fake_probability': 0.0,
+                'label': 'SKIPPED', 'confidence': 0.0, 'fake_probability': 0.0,
                 'is_fake': False, 'model': 'skipped'
             }
         # 🔥 OPTIMIZATION: For video, only use Gemini on first frame to save API tokens
@@ -254,18 +371,20 @@ class VisionPipeline:
         elif is_video_frame and not is_first_video_frame:
             # Skip Gemini for video frames (except first) — use fast local model instead
             print("   1️⃣ Deepfake Detection (local model, video optimization)...")
-            deepfake_result = self.deepfake_detector.predict(deepfake_input)
-        elif self.use_gemini_for_images and hasattr(self.deepfake_detector, 'gemini_model') and self.deepfake_detector.gemini_model:
+            deepfake_result = self.deepfake_detector.predict(deepfake_input, use_gemini=False)
+        elif skip_gemini or not (self.use_gemini_for_images and hasattr(self.deepfake_detector, 'gemini_model') and self.deepfake_detector.gemini_model):
+            # Skip Gemini if flag is set or Gemini not available
+            print("   1️⃣ Deepfake Detection (local model)...")
+            deepfake_result = self.deepfake_detector.predict(deepfake_input, use_gemini=False)
+        else:
+            # Use Gemini for image analysis
             gemini_source = " (first video frame only)" if is_video_frame else ""
             print(f"   🤖 Using Gemini API for image analysis{gemini_source}...")
             deepfake_result = self.deepfake_detector._predict_with_gemini(deepfake_input)
             if (not deepfake_result) or (deepfake_result.get('label') == 'UNKNOWN'):
                 # Fallback to primary model if Gemini fails/returns unknown
                 print("   ⚠️ Gemini unavailable/uncertain, using primary model...")
-                deepfake_result = self.deepfake_detector.predict(deepfake_input)
-        else:
-            print("   1️⃣ Deepfake Detection...")
-            deepfake_result = self.deepfake_detector.predict(deepfake_input)
+                deepfake_result = self.deepfake_detector.predict(deepfake_input, use_gemini=False)
         
         # ====== 2. FACE RECOGNITION ======
         print("   2️⃣ Face Recognition...")
@@ -300,7 +419,7 @@ class VisionPipeline:
         )
 
         tracking = None
-        if self.tracking_enabled and camera_id:
+        if self.tracking_enabled:  # FIXED: Enable for video uploads too
             tracker = self._trackers.get(stream_key)
             if tracker is None:
                 tracker = IOUTracker(
@@ -350,7 +469,13 @@ class VisionPipeline:
                 "identity": face_result['identity'],
                 "confidence": face_result['confidence'] / 100,
                 "similarity_score": face_result['similarity_score'],
-                "num_faces": face_result['num_faces']
+                "num_faces": face_result['num_faces'],
+                # Lightweight geometry used by advanced analytics fallback when YOLO person
+                # detections are absent but face detector still finds people.
+                "face_bboxes": [
+                    f.get('bbox') for f in face_result.get('faces', [])
+                    if isinstance(f.get('bbox'), list) and len(f.get('bbox')) == 4
+                ]
             },
             "objects": [
                 {
@@ -649,30 +774,107 @@ class VisionPipeline:
         self,
         video_path: str,
         output_path: Optional[str] = None,
-        frame_skip: int = 5
+        frame_skip: int = 5,
+        enable_advanced_analytics: bool = True,
+        use_gemini: bool = True,
+        user_id: Optional[str] = None,
     ) -> List[Dict]:
         """
-        Process video file through pipeline.
+        Process video file through pipeline with optional advanced analytics.
         
         Args:
             video_path: Path to video file
             output_path: Optional output path for annotated video
             frame_skip: Process every Nth frame
+            enable_advanced_analytics: Whether to run advanced analytics (disable for > 1 min videos)
+            use_gemini: Whether to use Gemini API for deepfake detection
+            user_id: Optional authenticated user id for per-user tracking context
             
         Returns:
             List of results per processed frame
         """
         print(f"\n🎥 Processing Video: {video_path}")
-        print(f"💰 OPTIMIZATION: Gemini deepfake detection runs ONLY on first frame (not every frame)")
+        print(f"🧩 Build Check: {self.pipeline_build}")
+        if enable_advanced_analytics:
+            print(f"💰 OPTIMIZATION: Gemini deepfake detection runs ONLY on first frame (not every frame)")
+        else:
+            print(f"⏭️  FAST MODE: Advanced analytics disabled (video > 1 min). Core analysis only.")
+        
+        if not use_gemini:
+            print(f"🚫 Gemini API disabled for this video (preserve tokens)")
         
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             raise ValueError(f"Cannot open video: {video_path}")
         
+        # Get video properties
+        frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        fps = int(cap.get(cv2.CAP_PROP_FPS))
+        
+        # Initialize advanced analytics with frame dimensions (only if enabled)
+        if enable_advanced_analytics and ADVANCED_ANALYTICS_AVAILABLE:
+            self.heatmap_generator = HeatmapGenerator(frame_h, frame_w, grid_size=32)
+            self.motion_detector = MotionDetector(method='mog2',  history=500)
+            self.crowd_analyzer = CrowdAnalyzer(frame_h, frame_w, grid_size=8)
+            self.trajectory_analyzer = TrajectoryAnalyzer(frame_h, frame_w, frame_rate=max(1, fps))
+            
+            # RESET loitering detector for this video
+            if self.loitering_detector:
+                self.loitering_detector.tracks = {}
+                self.loitering_detector.reported_loitering = set()
+                self.loitering_detector.reported_events = []
+                self.loitering_detector.frame_rate = fps
+
+            if self.suspicious_behavior_detector and hasattr(self.suspicious_behavior_detector, 'reset'):
+                self.suspicious_behavior_detector.reset()
+
+            if self.gesture_recognizer and hasattr(self.gesture_recognizer, 'reset'):
+                self.gesture_recognizer.reset()
+            
+            print(f"   📐 Advanced Analytics ENABLED: {frame_w}x{frame_h} @ {fps}fps")
+        else:
+            # Disable all advanced analytics modules
+            self.heatmap_generator = None
+            self.motion_detector = None
+            self.crowd_analyzer = None
+            self.trajectory_analyzer = None
+            self.loitering_detector = None
+            self.anomaly_detector = None
+            self.activity_recognizer = None
+            self.suspicious_behavior_detector = None
+            self.crowd_behavior_analyzer = None
+            if not ADVANCED_ANALYTICS_AVAILABLE:
+                print(f"   Warning: Advanced analytics unavailable")
+            else:
+                print(f"   ⏭️  Advanced analytics DISABLED")
+        
         results = []
         writer = None
         frame_count = 0
-        first_processed_frame = True  # Track first processed frame for Gemini optimization
+        first_processed_frame = True
+        frame_images_dir = None
+
+        # Sparse sampling causes IoU tracker ID churn; relax matching during this video only.
+        original_iou_threshold = self.tracking_iou_threshold
+        original_max_missed = self.tracking_max_missed
+        if self.tracking_enabled and frame_skip > 1:
+            self.tracking_iou_threshold = min(self.tracking_iou_threshold, 0.15)
+            self.tracking_max_missed = max(self.tracking_max_missed, frame_skip * 4)
+        
+        # Create an isolated tracker stream for this uploaded video run.
+        video_stream_id = f"video_upload::{uuid.uuid4().hex}"
+        stream_key = f"{user_id or 'anon'}::{video_stream_id}"
+        self._stream_frame_counters[stream_key] = 0
+        self._trackers.pop(stream_key, None)
+
+        # Face-fallback tracker for cases where person detector misses but faces are visible.
+        face_fallback_tracker = IOUTracker(iou_threshold=0.2, max_missed=max(8, frame_skip * 4))
+
+        # Create directory for saving frame previews (for frame-by-frame visualization)
+        frame_images_dir = Path(video_path).parent / f"frame_previews_{Path(video_path).stem}"
+        frame_images_dir.mkdir(exist_ok=True)
+        print(f"📸 Frame previews will be saved to: {frame_images_dir}")
 
         # Pre-load face DB once so we don't hit MongoDB on every frame
         if self.face_recognizer.use_mongodb and self.face_recognizer.mongodb_manager:
@@ -685,11 +887,23 @@ class VisionPipeline:
 
         # Setup video writer
         if output_path:
-            fps = int(cap.get(cv2.CAP_PROP_FPS))
             width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) + 120  # Add header
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            writer = cv2.VideoWriter(output_path, fourcc, fps // frame_skip, (width, height))
+            writer_fps = max(1, fps // max(1, frame_skip))
+            writer = cv2.VideoWriter(output_path, fourcc, writer_fps, (width, height))
+        
+        # Collect statistics for advanced analytics
+        advanced_stats = {
+            'activity_summary': defaultdict(int),
+            'anomalies_detected': [],
+            'crowd_density_timeline': [],
+            'loitering_incidents': [],
+            'unusual_movements': [],
+            'object_motion_events': [],
+            'frames_with_people': 0,
+            'heatmap_data': None
+        }
         
         while True:
             ret, frame = cap.read()
@@ -701,21 +915,227 @@ class VisionPipeline:
             if frame_count % frame_skip != 0:
                 continue
             
-            # Process frame with Gemini optimization: only first frame uses Gemini
+            # Process frame with all pipeline modules
             result = self.process_image(
                 frame,
-                return_annotated=output_path is not None,
-                is_video_frame=True,  # Tell analyzer this is a video frame
-                is_first_video_frame=first_processed_frame  # Only first frame uses Gemini
+                return_annotated=True,  # Always return annotated frames for frontend display!
+                user_id=user_id,
+                camera_id=video_stream_id,
+                is_video_frame=True,
+                is_first_video_frame=first_processed_frame,
+                skip_gemini=not use_gemini  # Skip Gemini if not enabled for this video
             )
-            first_processed_frame = False  # After first frame, use local model for deepfake
+            first_processed_frame = False
             result['frame_number'] = frame_count
-            results.append(result)
+            
+            # ========== ADVANCED ANALYTICS PROCESSING (NEW) - Only if enabled ==========
+            if enable_advanced_analytics and ADVANCED_ANALYTICS_AVAILABLE and result:
+                try:
+                    # Motion detection
+                    motion_mask, motion_mag = self.motion_detector.detect(frame)
+                    avg_motion = np.mean(motion_mag)
+                    print(f"      ✓ Motion detected (avg: {avg_motion:.2f})")
+                    
+                    # Crowd analysis
+                    # `process_image` returns objects with `label`, while advanced modules
+                    # expect a `class` field. Normalize once per frame.
+                    detections_raw = result.get('objects', [])
+                    detections = []
+                    for obj in detections_raw:
+                        obj_copy = dict(obj)
+                        cls = str(obj_copy.get('class') or obj_copy.get('label') or '').strip().lower()
+                        obj_copy['class'] = cls
+                        detections.append(obj_copy)
+
+                    person_detections = [
+                        obj for obj in detections
+                        if str(obj.get('class', '')).lower() == 'person'
+                    ]
+
+                    # Fallback: use detected face boxes as proxy person detections when
+                    # object detector does not produce person class in the frame.
+                    if not person_detections:
+                        face_info = result.get('face_recognition') or {}
+                        face_boxes = face_info.get('face_bboxes') or []
+
+                        valid_face_boxes = []
+                        for fb in face_boxes:
+                            if isinstance(fb, list) and len(fb) == 4:
+                                x1, y1, x2, y2 = fb
+                                valid_face_boxes.append([int(x1), int(y1), int(x2), int(y2)])
+
+                        if valid_face_boxes:
+                            _, fb_map = face_fallback_tracker.update(valid_face_boxes)
+                            for di, fb in enumerate(valid_face_boxes):
+                                person_proxy = {
+                                    'label': 'person',
+                                    'class': 'person',
+                                    'confidence': float(face_info.get('confidence', 0.0) or 0.0),
+                                    'bbox': fb,
+                                    'source': 'face_fallback',
+                                }
+                                tid = fb_map.get(di)
+                                if tid is not None:
+                                    person_proxy['track_id'] = tid
+                                detections.append(person_proxy)
+                                person_detections.append(person_proxy)
+                        else:
+                            # Age fallback tracker when no face boxes are present.
+                            face_fallback_tracker.update([])
+                    crowd_data = self.crowd_analyzer.analyze_density(detections)
+                    if crowd_data.get('person_count', 0) > 0:
+                        advanced_stats['frames_with_people'] += 1
+                    entry = {
+                        'frame': frame_count,
+                        'person_count': crowd_data.get('person_count', 0),
+                        'density_level': crowd_data.get('density_level', 'LOW'),
+                        'occupied_cells': crowd_data.get('occupied_cells', 0),
+                        'max_density': crowd_data.get('max_density_in_cell', 0)
+                    }
+                    advanced_stats['crowd_density_timeline'].append(entry)
+                    
+                    if frame_count % 30 == 0 or crowd_data.get('person_count', 0) > 0:
+                        print(f"      [Crowd] Frame {frame_count}: {crowd_data.get('person_count', 0)} people, {crowd_data.get('density_level', 'LOW')} density")
+                    
+                    # Heatmap accumulation
+                    if self.heatmap_generator:
+                        # Heatmap should represent human activity density, not all object classes.
+                        person_points = [
+                            {'bbox': obj['bbox']}
+                            for obj in detections
+                            if str(obj.get('class', '')).lower() == 'person' and 'bbox' in obj
+                        ]
+                        if person_points:
+                            self.heatmap_generator.add_detections(person_points)
+                        else:
+                            # Fallback: when no people are detected, still reflect scene activity
+                            # using motion hotspots so the activity heatmap is not blank.
+                            self.heatmap_generator.add_motion_mask(motion_mask, weight=0.35, min_motion_ratio=0.03)
+                    
+                    # Trajectory tracking
+                    if self.trajectory_analyzer:
+                        tracked_objects = 0
+                        tracked_persons = 0
+                        for obj in detections:
+                            if 'track_id' in obj:
+                                obj_class = str(obj.get('class', 'unknown')).lower()
+                                self.trajectory_analyzer.update_track(
+                                    obj['track_id'],
+                                    obj['bbox'],
+                                    frame_count,
+                                    object_class=obj_class,
+                                )
+                                tracked_objects += 1
+                                if obj_class == 'person':
+                                    tracked_persons += 1
+                        
+                        if tracked_objects > 0 and frame_count % 30 == 0:  # Log every 30 frames
+                            print(f"      [Trajectory] Frame {frame_count}: tracked {tracked_objects} objects ({tracked_persons} persons)")
+                    
+                    # Activity recognition
+                    if self.activity_recognizer:
+                        activities = self.activity_recognizer.detect_activities(
+                            frame, detections, motion_mask
+                        )
+                        result['activities'] = activities
+                        print(f"      ✓ Activities recognized ({len(activities)} detected)")
+                        
+                        for activity in activities:
+                            activity_type = activity.get('activity', 'UNKNOWN')
+                            advanced_stats['activity_summary'][activity_type] = advanced_stats['activity_summary'].get(activity_type, 0) + 1
+                            
+                            # Track suspicious behavior
+                            if self.suspicious_behavior_detector:
+                                self.suspicious_behavior_detector.update_person_behavior(
+                                    activity.get('person_id', 0),
+                                    activity_type,
+                                    activity,
+                                    frame_count
+                                )
+                    
+                    # Crowd behavior analysis
+                    if self.crowd_behavior_analyzer:
+                        activities = result.get('activities', [])
+                        crowd_behavior = self.crowd_behavior_analyzer.analyze_crowd(
+                            activities, detections
+                        )
+                        result['crowd_behavior'] = crowd_behavior
+                        print(f"      ✓ Crowd behavior analyzed")
+                    
+                    # Loitering detection
+                    if self.loitering_detector:
+                        self.loitering_detector.update(person_detections, frame_count)
+                        loitering = self.loitering_detector.detect_loitering()
+                        if loitering:
+                            advanced_stats['loitering_incidents'].extend(loitering)
+                            result['loitering_detected'] = loitering
+                            print(f"      ✓ Loitering detected ({len(loitering)} incidents)")
+                    
+                    # Behavioral anomaly detection
+                    if self.anomaly_detector:
+                        features = self.anomaly_detector.extract_features(detections, avg_motion)
+                        if features is not None:
+                            self.anomaly_detector.add_frame(features)
+                            anomalies = self.anomaly_detector.detect_anomalies()
+                            if anomalies:
+                                advanced_stats['anomalies_detected'].extend(anomalies)
+                                result['anomalies'] = anomalies
+                                print(f"      ✓ Anomalies detected ({len(anomalies)} found)")
+                    
+                    # Trajectory analysis for unusual movements
+                    if self.trajectory_analyzer:
+                        unusual = self.trajectory_analyzer.detect_unusual_movement()
+                        if unusual:
+                            person_unusual = [u for u in unusual if str(u.get('class', '')).lower() == 'person']
+                            object_motion_events = [u for u in unusual if str(u.get('class', '')).lower() != 'person']
+
+                            if person_unusual:
+                                advanced_stats['unusual_movements'].extend(person_unusual)
+                                result['unusual_movements'] = person_unusual
+                                print(f"      ✓ Unusual person movements found ({len(person_unusual)} identified)")
+
+                            if object_motion_events:
+                                result['object_motion_events'] = object_motion_events
+                                advanced_stats['object_motion_events'].extend(object_motion_events)
+                    
+                    # Suspicious behavior patterns
+                    if self.suspicious_behavior_detector:
+                        suspicious_patterns = self.suspicious_behavior_detector.detect_suspicious_patterns(frame_count)
+                        if suspicious_patterns:
+                            result['suspicious_patterns'] = suspicious_patterns
+                            print(f"      ✓ Suspicious patterns found ({len(suspicious_patterns)} patterns)")
+                    
+                    # Gesture and pose recognition (for threatening gestures/postures)
+                    if self.gesture_recognizer:
+                        try:
+                            gesture_analysis = self.gesture_recognizer.analyze_frame(frame)
+                            result['gesture_analysis'] = gesture_analysis
+                            if gesture_analysis.get('suspicious_behaviors'):
+                                print(f"      ✓ Suspicious gestures detected ({len(gesture_analysis['suspicious_behaviors'])} found)")
+                                # Add to overall threat assessment
+                                if gesture_analysis.get('threat_level') in ['HIGH', 'CRITICAL']:
+                                    result['risk_assessment']['reasons'].append(f"Suspicious gesture: {gesture_analysis['threat_level']}")
+                        except Exception as e:
+                            print(f"      ⚠️ Gesture analysis error: {e}")
+                    
+                    # Add advanced analytics to result
+                    result['advanced_analytics'] = {
+                        'motion_detected': bool(np.sum(motion_mask) > 0),
+                        'avg_motion_magnitude': float(avg_motion),
+                        'crowd_density': crowd_data,
+                    }
+                    print(f"      ✓ Advanced analytics added to frame result")
+                    
+                except Exception as e:
+                    print(f"   ⚠️ Advanced analytics error at frame {frame_count}: {e}")
+                    import traceback
+                    traceback.print_exc()
             
             # Write annotated frame
             if writer and 'annotated_image' in result:
                 writer.write(result['annotated_image'])
             
+            results.append(result)
             print(f"   Frame {frame_count}: {result['summary']}")
         
         cap.release()
@@ -723,10 +1143,49 @@ class VisionPipeline:
             writer.release()
             print(f"\n💾 Saved annotated video: {output_path}")
 
+        # Restore tracker settings after this video run.
+        self.tracking_iou_threshold = original_iou_threshold
+        self.tracking_max_missed = original_max_missed
+
+        # Drop temporary per-video stream state to avoid cross-video contamination.
+        self._trackers.pop(stream_key, None)
+        self._stream_frame_counters.pop(stream_key, None)
+
         # Re-enable per-call reload for subsequent live/image requests
         self.face_recognizer._skip_db_reload = False
 
+        # Generate heatmap visualization if available
+        if ADVANCED_ANALYTICS_AVAILABLE and self.heatmap_generator:
+            try:
+                heatmap = self.heatmap_generator.get_heatmap()
+                advanced_stats['heatmap_data'] = heatmap.tolist()
+                print(f"✅ Heatmap generated ({self.heatmap_generator.grid_size}x{self.heatmap_generator.grid_size} grid)")
+            except Exception as e:
+                print(f"⚠️ Heatmap generation failed: {e}")
+        
+        # Store advanced stats for report generation
+        # Convert defaultdict to regular dict for JSON serialization
+        advanced_stats_serializable = {
+            'activity_summary': dict(advanced_stats['activity_summary']),
+            'anomalies_detected': advanced_stats['anomalies_detected'],
+            'crowd_density_timeline': advanced_stats['crowd_density_timeline'],
+            'loitering_incidents': advanced_stats['loitering_incidents'],
+            'unusual_movements': advanced_stats['unusual_movements'],
+            'object_motion_events': advanced_stats['object_motion_events'],
+            'frames_with_people': advanced_stats['frames_with_people'],
+            'heatmap_data': advanced_stats['heatmap_data']
+        }
+        self._last_video_advanced_stats = advanced_stats_serializable
+
         print(f"\n✅ Processed {len(results)} frames")
+        print(f"\n📊 Advanced Analytics Summary:")
+        print(f"   Activities detected: {sum(advanced_stats['activity_summary'].values())}")
+        print(f"   Frames with people: {advanced_stats['frames_with_people']}")
+        print(f"   Anomalies found: {len(advanced_stats['anomalies_detected'])}")
+        print(f"   Loitering incidents: {len(advanced_stats['loitering_incidents'])}")
+        print(f"   Unusual movements: {len(advanced_stats['unusual_movements'])}")
+        print(f"   Non-person motion events: {len(advanced_stats['object_motion_events'])}")
+        
         return results
     
     async def _notify_unknown_faces(

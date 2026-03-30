@@ -19,6 +19,10 @@ function Settings() {
     web_control_enabled: false,
     voice_lock_enabled: false,
   });
+  const [loiteringSettings, setLoiteringSettings] = useState({
+    min_duration: 5.0,
+    position_threshold: 50
+  });
   const [voiceEnrolled, setVoiceEnrolled]   = useState(false);
   const [enrollStatus, setEnrollStatus]     = useState(null);
   const [loading, setLoading] = useState(false);
@@ -70,10 +74,56 @@ function Settings() {
         console.error('Failed to fetch assistant settings:', error);
       }
     };
+
+    const fetchVideoAnalysisSettings = async () => {
+      try {
+        const axios = authService.getAuthAxios();
+        const response = await axios.get('/user/video-analysis-settings');
+        if (response.data.settings) {
+          setLoiteringSettings({
+            min_duration: response.data.settings.min_loitering_duration || 5.0,
+            position_threshold: response.data.settings.loitering_position_threshold || 50
+          });
+        }
+      } catch (error) {
+        console.error('Failed to fetch video analysis settings:', error);
+      }
+    };
     
     fetchSettings();
     fetchAssistantSettings();
+    fetchVideoAnalysisSettings();
   }, []);
+
+  // Save video analysis settings
+  const saveVideoAnalysisSettings = async () => {
+    try {
+      setLoading(true);
+      const axios = authService.getAuthAxios();
+      await axios.put('/user/video-analysis-settings', {
+        min_loitering_duration: loiteringSettings.min_duration,
+        loitering_position_threshold: loiteringSettings.position_threshold
+      });
+      setSaveStatus({ type: 'success', message: '✅ Video analysis settings saved successfully!' });
+      setTimeout(() => setSaveStatus(null), 3000);
+    } catch (error) {
+      setSaveStatus({ 
+        type: 'error', 
+        message: error.response?.data?.detail || 'Failed to save video analysis settings' 
+      });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Handle loitering settings changes
+  const handleLoiteringChange = (field, value) => {
+    setLoiteringSettings(prev => ({
+      ...prev,
+      [field]: value
+    }));
+    setSaveStatus(null);
+  };
 
   const handleAssistantChange = (e) => {
     const { name, value, type, checked } = e.target;
@@ -816,6 +866,128 @@ function Settings() {
                 )}
               </span>
             </button>
+          </div>
+        </motion.div>
+
+        {/* Video Analysis Settings */}
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.2 }}
+          className="bg-[#060c18] rounded-2xl border border-slate-800/60 p-6"
+        >
+          <h2 className="text-xl font-semibold text-white mb-4 flex items-center gap-2">
+            <div className="p-2 bg-yellow-500/20 rounded-lg">
+              <AlertCircle className="w-5 h-5 text-yellow-400" />
+            </div>
+            Loitering Detection Settings
+          </h2>
+          <p className="text-slate-400 text-sm mb-6">
+            Customize how loitering is detected in video analysis. These settings determine what counts as suspicious loitering behavior.
+          </p>
+          
+          <div className="space-y-4">
+            {/* Min Duration Setting */}
+            <div className="p-4 bg-slate-800/30 rounded-lg border border-slate-700/50">
+              <div className="flex items-center justify-between mb-3">
+                <div>
+                  <label className="block font-medium text-white text-sm">⏱️ Minimum Loitering Duration</label>
+                  <p className="text-xs text-slate-400 mt-1">How long (in seconds) someone must stay in one place to be flagged as loitering</p>
+                </div>
+                <span className="px-3 py-1 bg-yellow-500/20 text-yellow-300 rounded-full text-sm font-mono">
+                  {loiteringSettings.min_duration}s
+                </span>
+              </div>
+              <input
+                type="range"
+                min="1"
+                max="30"
+                step="0.5"
+                value={loiteringSettings.min_duration}
+                onChange={(e) => handleLoiteringChange('min_duration', parseFloat(e.target.value))}
+                className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-yellow-500"
+              />
+              <div className="flex justify-between text-xs text-slate-500 mt-2">
+                <span>1s (Very Sensitive)</span>
+                <span>30s (Very Lenient)</span>
+              </div>
+            </div>
+
+            {/* Position Threshold Setting */}
+            <div className="p-4 bg-slate-800/30 rounded-lg border border-slate-700/50">
+              <div className="flex items-center justify-between mb-3">
+                <div>
+                  <label className="block font-medium text-white text-sm">📍 Position Threshold</label>
+                  <p className="text-xs text-slate-400 mt-1">Maximum distance (in pixels) someone can move and still be considered in the same location</p>
+                </div>
+                <span className="px-3 py-1 bg-purple-500/20 text-purple-300 rounded-full text-sm font-mono">
+                  {loiteringSettings.position_threshold}px
+                </span>
+              </div>
+              <input
+                type="range"
+                min="10"
+                max="200"
+                step="5"
+                value={loiteringSettings.position_threshold}
+                onChange={(e) => handleLoiteringChange('position_threshold', parseInt(e.target.value))}
+                className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-purple-500"
+              />
+              <div className="flex justify-between text-xs text-slate-500 mt-2">
+                <span>10px (Strict)</span>
+                <span>200px (Loose)</span>
+              </div>
+            </div>
+
+            {/* Info Box */}
+            <div className="p-4 bg-blue-500/10 border border-blue-500/30 rounded-lg">
+              <p className="text-xs text-blue-300 flex gap-2">
+                <span>ℹ️</span>
+                <span>
+                  <strong>Lower duration</strong> = more sensitive (flags loitering sooner) | 
+                  <strong> Smaller threshold</strong> = stricter (requires staying in exact same spot)
+                </span>
+              </p>
+            </div>
+
+            {/* Save Button */}
+            <button
+              onClick={saveVideoAnalysisSettings}
+              disabled={loading}
+              className="group relative w-full overflow-hidden rounded-lg p-px active:scale-[0.98] transition-transform duration-150 disabled:opacity-50 disabled:cursor-not-allowed focus:outline-none"
+            >
+              <span className="absolute inset-0 rounded-lg bg-gradient-to-r from-yellow-500 to-orange-500 opacity-80 group-hover:opacity-100 transition-opacity duration-300" />
+              <span className="relative flex items-center justify-center gap-2.5 w-full py-2.5 px-4 rounded-lg bg-[#0a1628] group-hover:bg-[#150d1e] transition-colors duration-200">
+                {loading ? (
+                  <>
+                    <div className="w-4 h-4 border-2 border-yellow-400 border-t-transparent rounded-full animate-spin" />
+                    <span className="text-sm font-semibold text-yellow-200">Saving...</span>
+                  </>
+                ) : (
+                  <>
+                    <Save className="w-4 h-4" />
+                    <span className="text-sm font-semibold bg-gradient-to-r from-yellow-300 to-orange-300 bg-clip-text text-transparent">
+                      Save Video Analysis Settings
+                    </span>
+                  </>
+                )}
+              </span>
+            </button>
+
+            {/* Save Status */}
+            {saveStatus && (
+              <motion.div
+                initial={{ opacity: 0, y: -10 }}
+                animate={{ opacity: 1, y: 0 }}
+                className={`p-3 rounded-lg ${
+                  saveStatus.type === 'success'
+                    ? 'bg-green-900/40 border border-green-500/50 text-green-300'
+                    : 'bg-red-900/40 border border-red-500/50 text-red-300'
+                }`}
+              >
+                {saveStatus.message}
+              </motion.div>
+            )}
           </div>
         </motion.div>
       </div>

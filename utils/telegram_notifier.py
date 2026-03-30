@@ -9,9 +9,10 @@ import asyncio
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
+from io import BytesIO
 import cv2
 import numpy as np
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
 try:
     from telegram.request import HTTPXRequest
 except Exception:  # pragma: no cover
@@ -62,6 +63,7 @@ class TelegramNotifier:
 
         # Track lifecycle
         self._started: bool = False
+        self._direct_bot: Optional[Bot] = None
         
         # Paths
         self.unknown_queue_path = Path("data/face_database/unknown_queue.json")
@@ -96,21 +98,43 @@ class TelegramNotifier:
             # Start bot (non-blocking)
             await self.app.initialize()
             await self.app.start()
-            
-            # Start polling to receive updates (button clicks, messages)
-            await self.app.updater.start_polling(drop_pending_updates=True)
-            
+
+            # Start polling to receive updates (button clicks, messages).
+            # If polling fails (network hiccup), keep notifier usable for outbound alerts.
+            try:
+                if self.app.updater:
+                    await self.app.updater.start_polling(drop_pending_updates=True)
+                    logger.info("✅ Telegram bot polling for updates (buttons will work)")
+            except Exception as poll_err:
+                logger.warning(f"⚠️ Telegram polling start failed, continuing in send-only mode: {poll_err}")
+
             logger.info("✅ Telegram bot started successfully")
-            logger.info("✅ Telegram bot polling for updates (buttons will work)")
-            
-            # Send startup message
-            await self.send_startup_message()
+
+            # Startup message should never abort notifier initialization.
+            try:
+                await self.send_startup_message()
+            except Exception as startup_err:
+                logger.warning(f"⚠️ Telegram startup message skipped: {startup_err}")
 
             self._started = True
             
         except Exception as e:
             logger.error(f"❌ Failed to initialize Telegram bot: {e}")
-            raise
+            # Do not raise here; send_text_message/send_photo_message can still
+            # work through direct-bot fallback even if polling/app startup fails.
+            self._started = False
+
+    def _get_direct_bot(self) -> Bot:
+        """Get or create a lightweight Bot client for outbound sends."""
+        if self._direct_bot is not None:
+            return self._direct_bot
+
+        if HTTPXRequest is not None:
+            request = HTTPXRequest(connect_timeout=25.0, read_timeout=35.0, write_timeout=35.0, pool_timeout=25.0)
+            self._direct_bot = Bot(token=self.bot_token, request=request)
+        else:
+            self._direct_bot = Bot(token=self.bot_token)
+        return self._direct_bot
     
     async def shutdown(self):
         """Shutdown the Telegram bot gracefully"""
@@ -127,9 +151,8 @@ class TelegramNotifier:
     async def send_text_message(self, text: str, parse_mode: Optional[str] = None) -> bool:
         """Send a plain Telegram message to the owner chat."""
         try:
-            if not self.app:
-                raise RuntimeError("Telegram notifier not initialized")
-            await self.app.bot.send_message(
+            bot = self.app.bot if self.app else self._get_direct_bot()
+            await bot.send_message(
                 chat_id=self.owner_chat_id,
                 text=text,
                 parse_mode=parse_mode,
@@ -137,6 +160,65 @@ class TelegramNotifier:
             return True
         except Exception as e:
             logger.error(f"❌ Failed to send text message: {e}")
+            return False
+
+    async def send_photo_message(
+        self,
+        image_bytes: bytes,
+        caption: Optional[str] = None,
+        parse_mode: Optional[str] = None,
+    ) -> bool:
+        """Send a photo message to the owner chat from raw bytes."""
+        try:
+            if not image_bytes:
+                return False
+
+            bot = self.app.bot if self.app else self._get_direct_bot()
+
+            # Re-encode to a moderate JPEG size for Telegram reliability.
+            # Large raw images can time out during upload on slower links.
+            payload = image_bytes
+            try:
+                np_buf = np.frombuffer(image_bytes, dtype=np.uint8)
+                img = cv2.imdecode(np_buf, cv2.IMREAD_COLOR)
+                if img is not None:
+                    h, w = img.shape[:2]
+                    max_side = max(h, w)
+                    if max_side > 1280:
+                        scale = 1280.0 / float(max_side)
+                        new_w = max(1, int(w * scale))
+                        new_h = max(1, int(h * scale))
+                        img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+                    ok, enc = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                    if ok:
+                        payload = enc.tobytes()
+            except Exception:
+                # Fall back to original bytes if re-encode fails.
+                pass
+
+            # Retry a few times because Telegram network calls can be transient.
+            for attempt in range(1, 4):
+                try:
+                    stream = BytesIO(payload)
+                    stream.name = "alert.jpg"
+                    stream.seek(0)
+
+                    await bot.send_photo(
+                        chat_id=self.owner_chat_id,
+                        photo=stream,
+                        caption=caption,
+                        parse_mode=parse_mode,
+                    )
+                    return True
+                except Exception as send_err:
+                    logger.warning(f"⚠️ Photo send attempt {attempt}/3 failed: {send_err}")
+                    if attempt < 3:
+                        await asyncio.sleep(0.8)
+
+            return False
+        except Exception as e:
+            logger.error(f"❌ Failed to send photo message: {e}")
             return False
     
     async def send_startup_message(self):
@@ -149,7 +231,8 @@ class TelegramNotifier:
                 "✅ Notifications ready\n\n"
                 "You will receive alerts when unknown persons are detected."
             )
-            await self.app.bot.send_message(
+            bot = self.app.bot if self.app else self._get_direct_bot()
+            await bot.send_message(
                 chat_id=self.owner_chat_id,
                 text=message,
                 parse_mode='Markdown'

@@ -21,7 +21,7 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Depends
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
-from typing import Optional, List
+from typing import Optional, List, TYPE_CHECKING, Any
 import sys
 import os
 import asyncio
@@ -33,6 +33,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PIL import Image
+from bson.objectid import ObjectId
 import io
 import json
 import base64
@@ -72,6 +73,9 @@ except Exception as _rag_import_err:
     RAGEngine = None  # type: ignore
     GeminiClient = None  # type: ignore
     print(f"[Assistant] RAG/LLM import failed: {_rag_import_err}")
+
+if TYPE_CHECKING:
+    from utils.rag_engine import RAGEngine as RAGEngineType
 
 from pipeline.vision_pipeline import VisionPipeline
 from utils.telegram_notifier import get_notifier, initialize_notifier, shutdown_notifier
@@ -180,7 +184,7 @@ async def startup_event():
     # (avoids multiple instances and ensures user-specific credentials)
 
 
-def _get_rag_for_user(user_id: str) -> "RAGEngine":
+def _get_rag_for_user(user_id: str) -> "RAGEngineType | Any":
     """Return (and lazily create/refresh) the per-user RAGEngine instance."""
     if user_id not in rag_engines:
         rag_engines[user_id] = RAGEngine(pipeline.mongodb_manager, _assistant_cfg)
@@ -1298,6 +1302,66 @@ async def send_telegram_message(
     return {"success": True}
 
 
+# ===== Video Analysis Settings =====
+class VideoAnalysisSettingsRequest(BaseModel):
+    """Video analysis customization settings"""
+    min_loitering_duration: float = 5.0  # seconds
+    loitering_position_threshold: int = 50  # pixels
+
+
+@app.get("/user/video-analysis-settings", tags=["User"])
+async def get_video_analysis_settings(current_user: dict = Depends(get_current_user)):
+    """Get current user's video analysis settings."""
+    if pipeline is None or not hasattr(pipeline, 'mongodb_manager') or pipeline.mongodb_manager is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    user = pipeline.mongodb_manager.get_user_by_id(current_user['user_id'])
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    settings = user.get('video_analysis_settings') or {
+        'min_loitering_duration': 5.0,
+        'loitering_position_threshold': 50
+    }
+    
+    return {"settings": settings}
+
+
+@app.put("/user/video-analysis-settings", tags=["User"])
+async def update_video_analysis_settings(
+    request: VideoAnalysisSettingsRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Update current user's video analysis settings."""
+    if pipeline is None or not hasattr(pipeline, 'mongodb_manager') or pipeline.mongodb_manager is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+
+    user = pipeline.mongodb_manager.get_user_by_id(current_user['user_id'])
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    settings = {
+        'min_loitering_duration': max(1.0, min(30.0, float(request.min_loitering_duration))),
+        'loitering_position_threshold': max(10, min(200, int(request.loitering_position_threshold)))
+    }
+
+    result = pipeline.mongodb_manager.db.users.update_one(
+        {'_id': ObjectId(current_user['user_id'])},
+        {'$set': {'video_analysis_settings': settings}}
+    )
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=500, detail="Failed to save settings")
+
+    print(f"✅ Video analysis settings saved for user {current_user['user_id']}: {settings}")
+
+    return {
+        "success": True,
+        "settings": settings,
+        "message": "Video analysis settings updated successfully"
+    }
+
+
 @app.get("/auth/me", response_model=UserResponse, tags=["Authentication"])
 async def get_me(current_user: dict = Depends(get_current_user)):
     """
@@ -1323,6 +1387,110 @@ async def get_me(current_user: dict = Depends(get_current_user)):
         "full_name": user['full_name'],
         "created_at": user['created_at'].isoformat()
     }
+
+
+# ===== Report Management Endpoints =====
+
+@app.get("/reports/list", tags=["Reports"])
+async def list_user_reports(current_user: dict = Depends(get_current_user)):
+    """
+    Get all analysis reports for the current user.
+    
+    Returns:
+        List of reports with metadata (without full chart data for efficiency)
+    """
+    if pipeline is None or not hasattr(pipeline, 'mongodb_manager') or pipeline.mongodb_manager is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    try:
+        user_id = current_user['user_id']
+        reports = pipeline.mongodb_manager.get_user_reports(user_id, limit=50)
+        
+        # Return summary without full chart data for efficiency
+        summary_reports = []
+        for report in reports:
+            summary_reports.append({
+                'id': report.get('_id'),
+                'generated_at': report.get('generated_at').isoformat() if report.get('generated_at') else None,
+                'metadata': report.get('metadata', {}),
+                'summary_stats': {
+                    'total_detections': len(report.get('report_data', {}).get('frame_details', [])),
+                    'risk_level': report.get('report_data', {}).get('statistics', {}).get('risk_level', 'UNKNOWN')
+                }
+            })
+        
+        return {
+            'total_reports': len(summary_reports),
+            'reports': summary_reports
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve reports: {str(e)}")
+
+
+@app.get("/reports/{report_id}", tags=["Reports"])
+async def get_report(report_id: str, current_user: dict = Depends(get_current_user)):
+    """
+    Get a specific report by ID.
+    
+    Args:
+        report_id: Report ID from MongoDB
+        
+    Returns:
+        Full report data including charts
+    """
+    if pipeline is None or not hasattr(pipeline, 'mongodb_manager') or pipeline.mongodb_manager is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    try:
+        user_id = current_user['user_id']
+        report = pipeline.mongodb_manager.get_report_by_id(report_id, user_id)
+        
+        if not report:
+            raise HTTPException(status_code=404, detail="Report not found or unauthorized")
+        
+        return {
+            'id': report.get('_id'),
+            'generated_at': report.get('generated_at').isoformat() if report.get('generated_at') else None,
+            'json_report': report.get('report_data'),
+            'timeline_chart': report.get('charts', {}).get('timeline'),
+            'statistics_chart': report.get('charts', {}).get('statistics'),
+            'metadata': report.get('metadata', {})
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve report: {str(e)}")
+
+
+@app.delete("/reports/{report_id}", tags=["Reports"])
+async def delete_report(report_id: str, current_user: dict = Depends(get_current_user)):
+    """
+    Delete a report.
+    
+    Args:
+        report_id: Report ID to delete
+        
+    Returns:
+        Success status
+    """
+    if pipeline is None or not hasattr(pipeline, 'mongodb_manager') or pipeline.mongodb_manager is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    try:
+        user_id = current_user['user_id']
+        success = pipeline.mongodb_manager.delete_report(report_id, user_id)
+        
+        if not success:
+            raise HTTPException(status_code=404, detail="Report not found or unauthorized")
+        
+        return {
+            'status': 'success',
+            'message': 'Report deleted successfully'
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete report: {str(e)}")
 
 
 @app.get("/health", response_model=HealthResponse, tags=["System"])
@@ -1537,19 +1705,33 @@ async def analyze_video(
     frame_skip: int = Form(5),
     return_annotated_video: bool = Form(False),
     weapon_detection_only: bool = Form(False),
-    current_user: Optional[dict] = Depends(get_current_user_optional),
+    generate_report: bool = Form(True),
+    current_user: dict = Depends(get_current_user),
 ):
     """
-    Analyze an uploaded video file with weapon detection.
+    Analyze an uploaded video file with AI/ML algorithms.
+    
+    Includes:
+    - Deepfake Detection
+    - Face Recognition
+    - Weapon/Object Detection
+    - Activity Recognition
+    - Behavioral Anomaly Detection
+    - Crowd Density Analysis
+    - Loitering Detection
+    - Trajectory Analysis
+    - Heatmap Generation
+    - Performance Reports
     
     Args:
         file: Video file (MP4, AVI, MOV)
         frame_skip: Process every Nth frame (1=all frames, 5=every 5th frame)
         return_annotated_video: Return annotated video with detections
         weapon_detection_only: Focus only on weapon detection (faster)
+        generate_report: Generate reports by default (True)
         
     Returns:
-        Video analysis results with weapon detections, timestamps, and summary
+        Video analysis results with advanced analytics, heatmaps, and summaries
     """
     if pipeline is None:
         raise HTTPException(status_code=503, detail="Pipeline not initialized")
@@ -1568,23 +1750,71 @@ async def analyze_video(
             tmp.write(await file.read())
         
         print(f"\n{'='*60}")
-        print(f"🎥 VIDEO ANALYSIS REQUEST")
+        print(f"🎥 VIDEO ANALYSIS REQUEST (WITH ADVANCED ANALYTICS)")
         print(f"{'='*60}")
         print(f"📥 File: {file.filename}")
         print(f"⚙️  Frame skip: {frame_skip}")
         print(f"🎯 Weapon detection focus: {weapon_detection_only}")
+        print(f"📊 Generate report: {generate_report}")
         
         # Setup output path for annotated video
         output_video_path = None
         if return_annotated_video:
             output_video_path = temp_path.replace(Path(temp_path).suffix, '_annotated.mp4')
         
-        # Process video
+        # Check video duration to optimize processing
+        cap_check = cv2.VideoCapture(temp_path)
+        fps_check = int(cap_check.get(cv2.CAP_PROP_FPS)) or 30
+        frame_count_check = int(cap_check.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+        cap_check.release()
+        video_duration_seconds = frame_count_check / fps_check if fps_check > 0 else 0
+        
+        # Advanced analytics: ALWAYS enabled for complete analysis (Activity, Crowd, Anomalies, Heatmap)
+        # Gemini API: Only use for videos <= 60 seconds (preserve free tier quota)
+        enable_advanced_analytics = True  # Always run advanced analytics for full features
+        use_gemini_api = video_duration_seconds <= 60  # Don't waste Gemini tokens on long videos
+        
+        print(f"\n⏱️ Video Duration: {video_duration_seconds:.1f}s ({frame_count_check} frames @ {fps_check}fps)")
+        print(f"🎯 Advanced Analytics: ENABLED ✓ (Activity, Crowd, Anomalies, Heatmap)")
+        print(f"🤖 Gemini API: {'ENABLED' if use_gemini_api else 'DISABLED (video > 60s, preserve tokens) 🚫'}")
+        effective_frame_skip = frame_skip
+        if enable_advanced_analytics and frame_skip > 5:
+            print(f"⚠️ frame_skip={frame_skip} may reduce tracking stability for loitering/unusual-movement metrics")
+
+        print(f"🚀 Processing with frame_skip={effective_frame_skip}")
+        
+        # Process video through complete pipeline with advanced analytics
         results = pipeline.process_video(
             temp_path, 
             output_path=output_video_path,
-            frame_skip=frame_skip
+            frame_skip=effective_frame_skip,
+            enable_advanced_analytics=enable_advanced_analytics,
+            use_gemini=use_gemini_api,
+            user_id=current_user.get('user_id') if current_user else None,
         )
+        
+        # Retrieve advanced analytics from pipeline only if enabled
+        advanced_analytics = getattr(pipeline, '_last_video_advanced_stats', {}) if enable_advanced_analytics else {}
+        
+        # Ensure advanced_analytics has all required keys for response
+        if not advanced_analytics:
+            advanced_analytics = {
+                'activity_summary': {},
+                'anomalies_detected': [],
+                'crowd_density_timeline': [],
+                'loitering_incidents': [],
+                'unusual_movements': [],
+                'heatmap_data': None
+            }
+        
+        # Add status indicator for debugging.
+        # Status should reflect execution mode, not whether specific result lists are empty.
+        analytics_status = "ENABLED" if enable_advanced_analytics else "DISABLED (video > 60s)"
+        advanced_analytics['status'] = analytics_status
+        advanced_analytics['enable_flag'] = enable_advanced_analytics
+        
+        if analytics_status == "DISABLED":
+            print(f"⚠️ Advanced analytics status: {analytics_status}")
         
         # Analyze weapon detections across frames
         weapon_detections = defaultdict(list)
@@ -1693,14 +1923,30 @@ async def analyze_video(
                 weapon_summary['first_detection'] = detections[0]['timestamp']
             weapon_summary['last_detection'] = detections[-1]['timestamp']
         
-        # Convert numpy types to Python types
+        # IMPORTANT: Encode annotated_image BEFORE converting numpy types to lists
+        # Otherwise cv2.imencode() will fail because the image will be a list, not numpy array
+        print(f"\n📸 Encoding frame images to base64...")
+        for result in results:
+            if 'annotated_image' in result and result['annotated_image'] is not None:
+                try:
+                    if isinstance(result['annotated_image'], np.ndarray):
+                        result['annotated_image'] = encode_image(result['annotated_image'])
+                    else:
+                        # If already converted to list or other type, skip encoding
+                        print(f"⚠️ Skipping encode: annotated_image is {type(result['annotated_image'])}, not numpy array")
+                        result['annotated_image'] = None
+                except Exception as img_err:
+                    print(f"❌ Error encoding annotated_image: {img_err}")
+                    result['annotated_image'] = None
+        print(f"✅ All frame images encoded to base64")
+        
+        # Convert numpy types to Python types (AFTER encoding images)
         results = convert_numpy_types(results)
         
         # Encode annotated video if requested
         annotated_video_base64 = None
         if return_annotated_video and output_video_path and os.path.exists(output_video_path):
             with open(output_video_path, 'rb') as f:
-                import base64
                 annotated_video_base64 = base64.b64encode(f.read()).decode('utf-8')
 
         # Note: Per project constraint, we do not delete temp files here.
@@ -1767,12 +2013,51 @@ async def analyze_video(
         print(f"   High Risk Frames: {sum(1 for r in results if r.get('risk_assessment', {}).get('risk_level') == 'HIGH')}")
         print(f"   Medium Risk Frames: {sum(1 for r in results if r.get('risk_assessment', {}).get('risk_level') == 'MEDIUM')}")
         
+        anomalies_all = advanced_analytics.get('anomalies_detected', [])
+        crowd_all = advanced_analytics.get('crowd_density_timeline', [])
+        loitering_all = advanced_analytics.get('loitering_incidents', [])
+        unusual_all = advanced_analytics.get('unusual_movements', [])
+        object_motion_all = advanced_analytics.get('object_motion_events', [])
+
         response = {
             "num_frames_processed": len(results),
+            "requested_frame_skip": frame_skip,
+            "effective_frame_skip": effective_frame_skip,
             "final_risk_level": final_risk_level,
             "weapon_summary": weapon_summary,
             "weapon_detections": dict(weapon_detections),
             "deepfake_summary": deepfake_summary,
+            "advanced_analytics": {
+                "activity_summary": dict(advanced_analytics.get('activity_summary', {})),
+                "anomalies_total": len(anomalies_all),
+                "crowd_density_points_total": len(crowd_all),
+                "loitering_incidents_total": len(loitering_all),
+                "unusual_movements_total": len(unusual_all),
+                "object_motion_events_total": len(object_motion_all),
+                "frames_with_people": int(advanced_analytics.get('frames_with_people', 0) or 0),
+                "anomalies_detected": anomalies_all[:50],
+                "crowd_density_timeline": crowd_all,
+                "loitering_incidents": loitering_all[:20],
+                "unusual_movements": unusual_all[:20],
+                "object_motion_events": object_motion_all[:20],
+                "heatmap_data": advanced_analytics.get('heatmap_data'),
+                "heatmap_generated": advanced_analytics.get('heatmap_data') is not None,
+                "status": advanced_analytics.get('status', 'UNKNOWN'),
+                "enabled": advanced_analytics.get('enable_flag', False),
+                "dependency_health": {
+                    "advanced_analytics_modules": bool(getattr(pipeline, 'heatmap_generator', None) is not None),
+                    "activity_recognition": bool(getattr(pipeline, 'activity_recognizer', None) is not None),
+                    "gesture_recognition": bool(getattr(pipeline, 'gesture_recognizer', None) is not None),
+                    "report_generator": bool(getattr(pipeline, 'report_generator', None) is not None),
+                    "mongodb_connected": bool(getattr(getattr(pipeline, 'mongodb_manager', None), 'is_connected', False)),
+                },
+                "preview_limits": {
+                    "anomalies_detected": 50,
+                    "loitering_incidents": 20,
+                    "unusual_movements": 20,
+                    "object_motion_events": 20
+                }
+            },
             "results": results if not weapon_detection_only else [
                 {
                     'frame_number': r['frame_number'],
@@ -1783,9 +2068,235 @@ async def analyze_video(
             ]
         }
         
+        # Generate report if requested
+        if generate_report and hasattr(pipeline, 'report_generator') and pipeline.report_generator:
+            try:
+                print(f"\n📄 Generating analysis reports...")
+                
+                # Generate JSON report
+                json_report = pipeline.report_generator.generate_json_report(
+                    file.filename,
+                    results,
+                    {'fps': fps, 'duration_seconds': len(results) / fps if fps > 0 else 0},
+                    advanced_analytics
+                )
+                response['json_report'] = json_report
+                
+                # Generate timeline chart
+                timeline_chart = pipeline.report_generator.generate_timeline_chart(results)
+                if timeline_chart:
+                    response['timeline_chart'] = timeline_chart
+                
+                # Generate statistics chart
+                stats_chart = pipeline.report_generator.generate_statistics_chart(advanced_analytics)
+                if stats_chart:
+                    response['statistics_chart'] = stats_chart
+                
+                # Save reports to MongoDB for the user
+                if hasattr(pipeline, 'mongodb_manager') and pipeline.mongodb_manager and current_user:
+                    try:
+                        user_id = current_user.get('user_id')
+                        if user_id:
+                            report_id = pipeline.mongodb_manager.save_report(
+                                user_id,
+                                json_report,
+                                timeline_chart or "",
+                                stats_chart or ""
+                            )
+                            if report_id:
+                                response['report_id'] = report_id
+                                print(f"✅ Report saved to MongoDB: {report_id}")
+                            else:
+                                print(f"⚠️ Failed to save report to MongoDB")
+                        else:
+                            print(f"⚠️ user_id not found in current_user")
+                    except Exception as db_error:
+                        print(f"⚠️ MongoDB save error: {db_error}")
+                
+                print(f"✅ Reports generated successfully")
+            except Exception as e:
+                print(f"⚠️ Report generation failed: {e}")
+        
         if annotated_video_base64:
             response['annotated_video'] = annotated_video_base64
         
+        # DEBUG: Log values before Telegram check
+        print(f"\n📋 Before Telegram check:")
+        print(f"   current_user: {current_user is not None}")
+        print(f"   final_risk_level: {final_risk_level} (type: {type(final_risk_level).__name__})")
+        print(f"   Condition: {current_user is not None and final_risk_level is not None and (final_risk_level.upper() if isinstance(final_risk_level, str) else final_risk_level) in ['HIGH', 'CRITICAL']}")
+        
+        # Send Telegram notification if alerts detected (background task)
+        if current_user and final_risk_level and final_risk_level.upper() in ['HIGH', 'CRITICAL']:
+            try:
+                user_id = current_user.get('user_id')
+                print(f"🔔 Attempting Telegram notification for user {user_id}...")
+                
+                if hasattr(pipeline, 'mongodb_manager') and pipeline.mongodb_manager:
+                    user = pipeline.mongodb_manager.get_user_by_id(user_id)
+                    print(f"   User found: {user is not None}")
+                    
+                    if user:
+                        tg_enabled = user.get('telegram_settings', {}).get('enabled', False)
+                        tg_token = user.get('telegram_settings', {}).get('bot_token', '')
+                        tg_chat_id = user.get('telegram_settings', {}).get('chat_id', '')
+                        
+                        print(f"   Telegram enabled: {tg_enabled} | Has token: {bool(tg_token)} | Has chat_id: {bool(tg_chat_id)}")
+                        
+                        if tg_enabled and tg_token and tg_chat_id:
+                            try:
+                                # Initialize notifier for this user if not already initialized
+                                print(f"   → Initializing notifier...")
+                                notifier = await initialize_notifier(
+                                    bot_token=tg_token,
+                                    owner_chat_id=int(tg_chat_id),
+                                    config={
+                                        'cooldown_minutes': int(user.get('telegram_settings', {}).get('cooldown_minutes', 3)),
+                                        'retention_days': int(user.get('telegram_settings', {}).get('retention_days', 10)),
+                                    },
+                                    face_recognizer=pipeline.face_recognizer if hasattr(pipeline, 'face_recognizer') else None,
+                                    user_id=user_id,
+                                )
+                                
+                                if notifier:
+                                    print(f"   ✓ Notifier initialized and started")
+
+                                    # Aggregate identity coverage across processed frames.
+                                    # unknown_*: strict face-recognition unknown hits.
+                                    # unidentified_person_frames: person seen but no known identity confirmed.
+                                    unknown_frames = 0
+                                    unknown_face_instances = 0
+                                    unidentified_person_frames = 0
+                                    for frame_result in results:
+                                        face_info = frame_result.get('face_recognition') or {}
+                                        identity = str(face_info.get('identity') or '').strip().lower()
+                                        objects = frame_result.get('objects') or []
+                                        person_count = sum(
+                                            1
+                                            for obj in objects
+                                            if str(obj.get('label', '')).strip().lower() == 'person'
+                                        )
+
+                                        has_known_identity = bool(
+                                            face_info.get('face_detected')
+                                            and identity not in {'unknown', '', 'no face detected', 'n/a'}
+                                        )
+
+                                        if person_count > 0 and not has_known_identity:
+                                            unidentified_person_frames += 1
+
+                                        if not face_info.get('face_detected'):
+                                            continue
+
+                                        if identity in {'unknown', ''}:
+                                            unknown_frames += 1
+                                            faces_in_frame = int(face_info.get('num_faces') or 1)
+                                            unknown_face_instances += max(1, faces_in_frame)
+                                    
+                                    msg_parts = ["🚨 *Video Analysis Alert*"]
+                                    msg_parts.append(f"📊 Risk Level: *{final_risk_level}*")
+                                    
+                                    if weapon_summary.get('total_weapons_detected', 0) > 0:
+                                        msg_parts.append(f"🔫 Weapons Detected: {weapon_summary['total_weapons_detected']}")
+
+                                    msg_parts.append(
+                                        f"👤 Unknown Faces: ~{unknown_face_instances} sightings across {unknown_frames} frame(s)"
+                                    )
+                                    msg_parts.append(
+                                        f"🕵️ Unidentified Person Frames: {unidentified_person_frames}"
+                                    )
+                                    
+                                    if advanced_analytics.get('anomalies_detected'):
+                                        msg_parts.append(f"⚠️ Anomalies: {len(advanced_analytics['anomalies_detected'])}")
+                                    
+                                    if advanced_analytics.get('loitering_incidents'):
+                                        msg_parts.append(f"🚶 Loitering Incidents: {len(advanced_analytics['loitering_incidents'])}")
+                                    
+                                    msg_parts.append(f"📹 Frames: {len(results)}")
+                                    message = "\n".join(msg_parts)
+
+                                    # Send one snapshot image with the alert when available.
+                                    # Priority: strict unknown face -> unidentified person -> HIGH/CRITICAL.
+                                    snapshot_b64 = None
+                                    for frame_result in results:
+                                        face_info = frame_result.get('face_recognition') or {}
+                                        identity = str(face_info.get('identity') or '').strip().lower()
+                                        if face_info.get('face_detected') and identity in {'unknown', ''}:
+                                            snapshot_b64 = frame_result.get('annotated_image')
+                                            if snapshot_b64:
+                                                break
+
+                                    if not snapshot_b64:
+                                        for frame_result in results:
+                                            face_info = frame_result.get('face_recognition') or {}
+                                            identity = str(face_info.get('identity') or '').strip().lower()
+                                            objects = frame_result.get('objects') or []
+                                            person_present = any(
+                                                str(obj.get('label', '')).strip().lower() == 'person'
+                                                for obj in objects
+                                            )
+                                            has_known_identity = bool(
+                                                face_info.get('face_detected')
+                                                and identity not in {'unknown', '', 'no face detected', 'n/a'}
+                                            )
+                                            if person_present and not has_known_identity:
+                                                snapshot_b64 = frame_result.get('annotated_image')
+                                                if snapshot_b64:
+                                                    break
+
+                                    if not snapshot_b64:
+                                        for frame_result in results:
+                                            risk = (frame_result.get('risk_assessment') or {}).get('risk_level', '').upper()
+                                            if risk in {'HIGH', 'CRITICAL'}:
+                                                snapshot_b64 = frame_result.get('annotated_image')
+                                                if snapshot_b64:
+                                                    break
+
+                                    success = False
+                                    if snapshot_b64:
+                                        try:
+                                            snapshot_bytes = base64.b64decode(snapshot_b64)
+                                            # Single-message alert: photo + full caption
+                                            success = await notifier.send_photo_message(
+                                                snapshot_bytes,
+                                                caption=message,
+                                                parse_mode='Markdown',
+                                            )
+                                            if success:
+                                                print("✅ Telegram photo alert sent (single message)")
+                                            else:
+                                                print("⚠️ Telegram photo alert failed, trying text fallback")
+                                        except Exception as photo_err:
+                                            print(f"⚠️ Failed to build/send photo alert: {photo_err}")
+                                    else:
+                                        print("⚠️ No snapshot frame selected for Telegram alert, using text-only fallback")
+
+                                    if not success:
+                                        success = await notifier.send_text_message(message, parse_mode='Markdown')
+
+                                    if success:
+                                        print(f"✅ Telegram notification sent successfully")
+                                    else:
+                                        print(f"⚠️ Telegram send returned False")
+                                else:
+                                    print(f"   ❌ Notifier initialization failed (returned None)")
+                                    
+                            except Exception as init_err:
+                                print(f"   ❌ Notifier initialization error: {type(init_err).__name__}: {init_err}")
+                        else:
+                            print(f"   ⚠️ Telegram settings incomplete (enabled={tg_enabled}, token={bool(tg_token)}, chat_id={bool(tg_chat_id)})")
+                    else:
+                        print(f"   ❌ User not found in database")
+                else:
+                    print(f"   ❌ MongoDB manager not available")
+                    
+            except Exception as e:
+                import traceback
+                print(f"❌ Telegram notification error: {e}")
+                traceback.print_exc()
+        
+        # Final safety pass: ensure no numpy scalars/arrays remain in response.
+        response = convert_numpy_types(response)
         return response
     
     except Exception as e:

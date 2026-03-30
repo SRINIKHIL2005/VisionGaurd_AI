@@ -155,7 +155,7 @@ class DeepfakeDetector:
             tensor = transform(image).unsqueeze(0)
             return tensor.to(self.device)
     
-    def predict(self, image: Union[np.ndarray, Image.Image]) -> Dict[str, Union[float, bool, str]]:
+    def predict(self, image: Union[np.ndarray, Image.Image], use_gemini: bool = True) -> Dict[str, Union[float, bool, str]]:
         """
         Predict whether the input image is a deepfake.
         
@@ -205,8 +205,9 @@ class DeepfakeDetector:
                 fake_prob = probabilities[0][0].item()
                 real_prob = probabilities[0][1].item() if probabilities.shape[-1] > 1 else 1 - probabilities[0][0].item()
             
-            # Use configured threshold for fake detection
-            is_fake = fake_prob > self.threshold
+            # Use threshold + class preference so near 50/50 outputs do not flip to FAKE
+            # unless fake probability is both above threshold and at least as likely as REAL.
+            is_fake = (fake_prob >= self.threshold) and (fake_prob >= real_prob)
             confidence = max(fake_prob, real_prob) * 100
             label = "FAKE" if is_fake else "REAL"
             
@@ -221,8 +222,8 @@ class DeepfakeDetector:
                 'label': label
             }
 
-            # If Gemini is available, combine results
-            if self.gemini_model:
+            # Optional Gemini fusion (disabled for long videos / local-only runs).
+            if use_gemini and self.gemini_model:
                 gemini_result = self._predict_with_gemini(image)
 
                 # If Gemini failed, fall back to model result

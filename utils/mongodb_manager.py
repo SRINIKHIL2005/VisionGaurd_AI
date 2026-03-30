@@ -18,6 +18,7 @@ import pickle
 import base64
 import time
 import threading
+import copy
 
 
 class MongoDBManager:
@@ -29,6 +30,7 @@ class MongoDBManager:
     _CONNECT_TIMEOUT_MS = 30000
     _SOCKET_TIMEOUT_MS  = 30000
     _SERVER_SEL_TIMEOUT_MS = 30000
+    _MAX_BSON_BYTES = 16 * 1024 * 1024
 
     def __init__(self, connection_string: str, database_name: str = "visionguard_ai"):
         """
@@ -223,6 +225,13 @@ class MongoDBManager:
             self.db.create_collection('user_actions')
         self.db.user_actions.create_index([('user_id', ASCENDING), ('timestamp', DESCENDING)])
         self.db.user_actions.create_index([('user_id', ASCENDING), ('action_type', ASCENDING)])
+        
+        # Reports Collection
+        if 'reports' not in self.db.list_collection_names():
+            self.db.create_collection('reports')
+        self.db.reports.create_index([('user_id', ASCENDING), ('generated_at', DESCENDING)])
+        self.db.reports.create_index([('user_id', ASCENDING)])
+        self.db.reports.create_index([('generated_at', DESCENDING)])
     
     # ===== User Management Operations =====
     
@@ -740,6 +749,245 @@ class MongoDBManager:
                 'high_risk_detections': 0, 'db_status': 'error',
             }
     
+    # ===== Report Management Operations =====
+
+    def _sanitize_bson_types(self, obj: Any) -> Any:
+        """Recursively convert numpy types into BSON-serializable Python types."""
+        if isinstance(obj, dict):
+            return {k: self._sanitize_bson_types(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self._sanitize_bson_types(v) for v in obj]
+        if isinstance(obj, tuple):
+            return [self._sanitize_bson_types(v) for v in obj]
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.bool_):
+            return bool(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return obj
+
+    def _prune_report_for_storage(self, report_data: Dict, drop_charts: bool = False) -> Dict:
+        """
+        Create a MongoDB-friendly report payload by removing oversized frame-level fields.
+        """
+        pruned = copy.deepcopy(report_data)
+
+        if isinstance(pruned, dict):
+            frame_details = pruned.get('frame_details')
+            if isinstance(frame_details, list):
+                compact_frames = []
+                for item in frame_details[:25]:
+                    if isinstance(item, dict):
+                        slim = dict(item)
+                        # Remove heavy image/frame blobs if present.
+                        slim.pop('annotated_image', None)
+                        slim.pop('image_base64', None)
+                        slim.pop('raw_frame', None)
+                        slim.pop('frame_image', None)
+
+                        # Keep object list compact if it's very long.
+                        if isinstance(slim.get('objects'), list) and len(slim['objects']) > 20:
+                            slim['objects'] = slim['objects'][:20]
+                        compact_frames.append(slim)
+                    else:
+                        compact_frames.append(item)
+                pruned['frame_details'] = compact_frames
+
+            # Keep timeline/violations bounded for storage safety.
+            if isinstance(pruned.get('timeline'), list) and len(pruned['timeline']) > 200:
+                pruned['timeline'] = pruned['timeline'][:200]
+            if isinstance(pruned.get('threshold_violations'), list) and len(pruned['threshold_violations']) > 100:
+                pruned['threshold_violations'] = pruned['threshold_violations'][:100]
+
+        pruned = self._sanitize_bson_types(pruned)
+
+        if drop_charts:
+            return {'report_data': pruned, 'charts': {'timeline': '', 'statistics': ''}}
+        return {'report_data': pruned, 'charts': None}
+    
+    def save_report(self, user_id: str, report_data: Dict, timeline_chart: str, statistics_chart: str) -> Optional[str]:
+        """
+        Save analysis report to MongoDB for a user.
+        
+        Args:
+            user_id: User ID
+            report_data: JSON report data (metadata + statistics)
+            timeline_chart: Timeline chart as base64 data URI
+            statistics_chart: Statistics chart as base64 data URI
+            
+        Returns:
+            Report ID if successful, None otherwise
+        """
+        self._try_reconnect_if_due()
+        db = self._require_db()
+        if db is None:
+            return None
+        
+        try:
+            report_doc = {
+                'user_id': user_id,
+                'generated_at': datetime.now(),
+                'report_data': report_data,
+                'charts': {
+                    'timeline': timeline_chart,
+                    'statistics': statistics_chart
+                },
+                'metadata': {
+                    'input_file': report_data.get('metadata', {}).get('input_file', 'Unknown'),
+                    'frames_analyzed': report_data.get('metadata', {}).get('total_frames_analyzed', 0),
+                    'duration_seconds': report_data.get('metadata', {}).get('duration_seconds', 0)
+                }
+            }
+            
+            report_doc = self._sanitize_bson_types(report_doc)
+            result = db.reports.insert_one(report_doc)
+            return str(result.inserted_id)
+        except Exception as e:
+            msg = str(e)
+            if 'BSON document too large' in msg or 'supports BSON document sizes up to' in msg:
+                try:
+                    # Retry 1: prune heavy per-frame fields but keep charts.
+                    compact = self._prune_report_for_storage(report_data, drop_charts=False)
+                    retry_doc = {
+                        'user_id': user_id,
+                        'generated_at': datetime.now(),
+                        'report_data': compact['report_data'],
+                        'charts': {
+                            'timeline': timeline_chart,
+                            'statistics': statistics_chart
+                        },
+                        'metadata': {
+                            'input_file': report_data.get('metadata', {}).get('input_file', 'Unknown'),
+                            'frames_analyzed': report_data.get('metadata', {}).get('total_frames_analyzed', 0),
+                            'duration_seconds': report_data.get('metadata', {}).get('duration_seconds', 0),
+                            'storage_mode': 'compact'
+                        }
+                    }
+                    retry_doc = self._sanitize_bson_types(retry_doc)
+                    result = db.reports.insert_one(retry_doc)
+                    print("⚠️ Report exceeded BSON size; saved compact report instead")
+                    return str(result.inserted_id)
+                except Exception as e2:
+                    msg2 = str(e2)
+                    if 'BSON document too large' in msg2 or 'supports BSON document sizes up to' in msg2:
+                        try:
+                            # Retry 2: compact + drop charts.
+                            compact = self._prune_report_for_storage(report_data, drop_charts=True)
+                            retry_doc = {
+                                'user_id': user_id,
+                                'generated_at': datetime.now(),
+                                'report_data': compact['report_data'],
+                                'charts': compact['charts'],
+                                'metadata': {
+                                    'input_file': report_data.get('metadata', {}).get('input_file', 'Unknown'),
+                                    'frames_analyzed': report_data.get('metadata', {}).get('total_frames_analyzed', 0),
+                                    'duration_seconds': report_data.get('metadata', {}).get('duration_seconds', 0),
+                                    'storage_mode': 'compact_no_charts'
+                                }
+                            }
+                            retry_doc = self._sanitize_bson_types(retry_doc)
+                            result = db.reports.insert_one(retry_doc)
+                            print("⚠️ Report exceeded BSON size; saved compact report without charts")
+                            return str(result.inserted_id)
+                        except Exception as e3:
+                            print(f"⚠️ Failed to save compact report to MongoDB: {e3}")
+                            return None
+                    print(f"⚠️ Failed to save compact report to MongoDB: {e2}")
+                    return None
+
+            print(f"⚠️ Failed to save report to MongoDB: {e}")
+            return None
+    
+    def get_user_reports(self, user_id: str, limit: int = 20) -> List[Dict]:
+        """
+        Get all reports for a user, ordered by generation time (newest first).
+        
+        Args:
+            user_id: User ID
+            limit: Maximum number of reports to retrieve
+            
+        Returns:
+            List of report documents
+        """
+        self._try_reconnect_if_due()
+        db = self._require_db()
+        if db is None:
+            return []
+        
+        try:
+            reports = list(db.reports.find(
+                {'user_id': user_id},
+                sort=[('generated_at', DESCENDING)],
+                limit=limit
+            ))
+            # Convert ObjectId to string for JSON serialization
+            for report in reports:
+                if '_id' in report:
+                    report['_id'] = str(report['_id'])
+            return reports
+        except Exception as e:
+            print(f"⚠️ Failed to retrieve reports from MongoDB: {e}")
+            return []
+    
+    def get_report_by_id(self, report_id: str, user_id: str) -> Optional[Dict]:
+        """
+        Get a specific report by ID (must own the report).
+        
+        Args:
+            report_id: Report ID (MongoDB ObjectId)
+            user_id: User ID (for ownership verification)
+            
+        Returns:
+            Report document if found and user owns it, None otherwise
+        """
+        self._try_reconnect_if_due()
+        db = self._require_db()
+        if db is None:
+            return None
+        
+        try:
+            from bson.objectid import ObjectId
+            report = db.reports.find_one({
+                '_id': ObjectId(report_id),
+                'user_id': user_id
+            })
+            if report:
+                report['_id'] = str(report['_id'])
+            return report
+        except Exception as e:
+            print(f"⚠️ Failed to retrieve report from MongoDB: {e}")
+            return None
+    
+    def delete_report(self, report_id: str, user_id: str) -> bool:
+        """
+        Delete a report (must own the report).
+        
+        Args:
+            report_id: Report ID
+            user_id: User ID (for ownership verification)
+            
+        Returns:
+            True if deleted, False otherwise
+        """
+        self._try_reconnect_if_due()
+        db = self._require_db()
+        if db is None:
+            return False
+        
+        try:
+            from bson.objectid import ObjectId
+            result = db.reports.delete_one({
+                '_id': ObjectId(report_id),
+                'user_id': user_id
+            })
+            return result.deleted_count > 0
+        except Exception as e:
+            print(f"⚠️ Failed to delete report from MongoDB: {e}")
+            return False
+
     def close(self):
         """Close MongoDB connection"""
         if self.client:
