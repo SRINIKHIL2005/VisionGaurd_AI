@@ -25,11 +25,11 @@ class MongoDBManager:
     """MongoDB manager for VisionGuard AI"""
 
     # How long to wait before retrying a failed connection (seconds)
-    _RETRY_INTERVAL = 30
+    _RETRY_INTERVAL = 10
     # Atlas-friendly timeouts (ms)
-    _CONNECT_TIMEOUT_MS = 30000
-    _SOCKET_TIMEOUT_MS  = 30000
-    _SERVER_SEL_TIMEOUT_MS = 30000
+    _CONNECT_TIMEOUT_MS = 8000
+    _SOCKET_TIMEOUT_MS  = 8000
+    _SERVER_SEL_TIMEOUT_MS = 5000
     _MAX_BSON_BYTES = 16 * 1024 * 1024
 
     def __init__(self, connection_string: str, database_name: str = "visionguard_ai"):
@@ -41,7 +41,7 @@ class MongoDBManager:
             connection_string: MongoDB connection string
             database_name: Database name to use
         """
-        self.connection_string = connection_string
+        self.connection_string = self._sanitize_connection_string(connection_string)
         self.database_name = database_name
         self.client = None
         self._db = None                  # backing store for the db property
@@ -70,8 +70,18 @@ class MongoDBManager:
         import re
         uri = re.sub(r'[&?]tls(?:Allow\w+|Insecure|CAFile|CertificateKey(?:File|Password)?|[^=&]*)=[^&]*', '', self.connection_string)
         uri = re.sub(r'[&?]ssl(?:[^=&]*)=[^&]*', '', uri)
+        uri = re.sub(r'[&?](?:connectTimeoutMS|socketTimeoutMS|serverSelectionTimeoutMS|waitQueueTimeoutMS|wTimeoutMS|maxIdleTimeMS|heartbeatFrequencyMS)=[^&]*', '', uri)
         uri = re.sub(r'[?&]$', '', uri)
         return uri
+
+    def _sanitize_connection_string(self, uri: str) -> str:
+        """Normalize known URI mistakes so transient config typos do not break startup."""
+        if not uri:
+            return uri
+        fixed = uri.replace('moongodb.net', 'mongodb.net')
+        if fixed != uri:
+            print("⚠️  Corrected MongoDB host typo: moongodb.net -> mongodb.net")
+        return fixed
 
     def _build_client(self, allow_insecure_tls: bool = False) -> MongoClient:
         """Build a MongoClient.  NOTE: MongoClient is lazy — this never raises."""

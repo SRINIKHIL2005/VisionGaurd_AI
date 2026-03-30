@@ -879,9 +879,7 @@ class VisionPipeline:
         # Pre-load face DB once so we don't hit MongoDB on every frame
         if self.face_recognizer.use_mongodb and self.face_recognizer.mongodb_manager:
             print(f"📂 Pre-loading face database for video processing...")
-            self.face_recognizer.face_database = self.face_recognizer.mongodb_manager.get_all_faces(
-                self.face_recognizer.user_id
-            )
+            self.face_recognizer._refresh_database_from_mongodb(force=True, reason="video-preload")
             print(f"✅ Loaded {len(self.face_recognizer.face_database)} identities (cached for video)")
         self.face_recognizer._skip_db_reload = True
 

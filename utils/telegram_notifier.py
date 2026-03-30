@@ -38,7 +38,7 @@ WAITING_FOR_TEMP_NAME = 3
 class TelegramNotifier:
     """Handles Telegram notifications for unknown face detections"""
     
-    def __init__(self, bot_token: str, owner_chat_id: int, config: dict, face_recognizer=None):
+    def __init__(self, bot_token: str, owner_chat_id: int, config: dict, face_recognizer=None, notifier_user_id: Optional[str] = None):
         """
         Initialize Telegram notifier
         
@@ -47,11 +47,13 @@ class TelegramNotifier:
             owner_chat_id: Owner's Telegram chat ID
             config: Configuration dictionary with settings
             face_recognizer: Shared FaceRecognizer instance from pipeline (to avoid sync issues)
+            notifier_user_id: User ID associated with this notifier instance
         """
         self.bot_token = bot_token
         self.owner_chat_id = owner_chat_id
         self.config = config
         self.face_recognizer = face_recognizer  # Use shared instance
+        self.notifier_user_id = notifier_user_id
         self.app = None
         self.pending_approvals = {}  # {detection_id: {data}}
         self.conversation_state = {}  # {chat_id: {state, detection_id}}
@@ -744,17 +746,45 @@ class TelegramNotifier:
                 'approval_timestamp': datetime.now().isoformat()
             }
             
-            for idx, embedding in enumerate(embeddings):
-                # For multiple faces, add suffix if needed
-                if len(embeddings) > 1:
-                    name = f"{person_name}_{idx+1}"
-                else:
-                    name = person_name
-                
-                # Add to database with metadata
-                self.face_recognizer.add_face(name, embedding, metadata)
-            
-            logger.info(f"✅ Added {len(embeddings)} face(s) as '{person_name}' with metadata (now has {len(self.face_recognizer.face_database)} identities)")
+            target_user_id = (self.notifier_user_id or self.face_recognizer.user_id or '').strip()
+            if not target_user_id:
+                logger.error(
+                    f"Cannot approve detection {detection_id}: user_id is empty "
+                    f"(notifier_user_id={self.notifier_user_id}, recognizer_user_id={self.face_recognizer.user_id})"
+                )
+                return False
+
+            # Ensure face_recognizer writes under the notifier's user scope.
+            original_user_id = self.face_recognizer.user_id
+            self.face_recognizer.user_id = target_user_id
+            added_count = 0
+            try:
+                for idx, embedding in enumerate(embeddings):
+                    # For multiple faces, add suffix if needed
+                    if len(embeddings) > 1:
+                        name = f"{person_name}_{idx+1}"
+                    else:
+                        name = person_name
+
+                    # Add to database with metadata
+                    if self.face_recognizer.add_face(name, embedding, metadata):
+                        added_count += 1
+                    else:
+                        logger.error(f"Failed to add face '{name}' for user {target_user_id}")
+            finally:
+                self.face_recognizer.user_id = original_user_id
+
+            if added_count != len(embeddings):
+                logger.error(
+                    f"Approval incomplete for detection {detection_id}: "
+                    f"added {added_count}/{len(embeddings)} faces for user {target_user_id}"
+                )
+                return False
+
+            logger.info(
+                f"✅ Added {added_count} face(s) as '{person_name}' for user {target_user_id} "
+                f"(cache size: {len(self.face_recognizer.face_database)})"
+            )
             
             # Update queue status
             detection_data['status'] = 'approved'
@@ -833,13 +863,25 @@ def get_notifier(
     if effective_user_id:
         notifier = _notifier_instances.get(effective_user_id)
         if notifier is None and bot_token and owner_chat_id:
-            notifier = TelegramNotifier(bot_token, owner_chat_id, config or {}, face_recognizer)
+            notifier = TelegramNotifier(
+                bot_token,
+                owner_chat_id,
+                config or {},
+                face_recognizer,
+                notifier_user_id=effective_user_id,
+            )
             _notifier_instances[effective_user_id] = notifier
         return notifier
 
     # Backward-compatible single default instance (stored under key 'default')
     if 'default' not in _notifier_instances and bot_token and owner_chat_id:
-        _notifier_instances['default'] = TelegramNotifier(bot_token, owner_chat_id, config or {}, face_recognizer)
+        _notifier_instances['default'] = TelegramNotifier(
+            bot_token,
+            owner_chat_id,
+            config or {},
+            face_recognizer,
+            notifier_user_id='default',
+        )
         _default_notifier_user_id = 'default'
     return _notifier_instances.get('default')
 

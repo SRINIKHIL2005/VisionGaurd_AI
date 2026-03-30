@@ -27,6 +27,7 @@ from PIL import Image
 import os
 import pickle
 import warnings
+import time
 
 warnings.filterwarnings('ignore')
 
@@ -77,6 +78,8 @@ class FaceRecognizer:
         self.mongodb_manager = mongodb_manager
         self.use_mongodb = mongodb_manager is not None
         self.user_id = user_id
+        self._last_db_refresh_at = 0.0
+        self._db_refresh_interval_sec = int(os.getenv('FACE_DB_REFRESH_INTERVAL_SECONDS', '15'))
         
         # Determine device
         if device == 'auto':
@@ -123,9 +126,8 @@ class FaceRecognizer:
     def _load_database(self):
         """Load face embeddings database from MongoDB or disk"""
         if self.use_mongodb:
-            # Load from MongoDB WITH user_id
-            self.face_database = self.mongodb_manager.get_all_faces(self.user_id)
-            print(f"📂 Loaded {len(self.face_database)} identities from MongoDB (user: {self.user_id})")
+            # Load from MongoDB WITH user_id; if Mongo is flaky, keep cache semantics consistent.
+            self._refresh_database_from_mongodb(force=True, reason="startup")
         else:
             # Load from pickle file
             os.makedirs(self.database_path, exist_ok=True)
@@ -160,6 +162,45 @@ class FaceRecognizer:
                 print(f"📂 Loaded {len(self.face_database)} identities from database")
             else:
                 print("📂 No existing database found. Starting fresh.")
+
+    def _refresh_database_from_mongodb(self, force: bool = False, reason: str = "runtime") -> bool:
+        """
+        Refresh local face cache from MongoDB.
+        Returns True if cache was updated, False otherwise.
+
+        Behavior during transient outages:
+        - If Mongo returns empty while cache already has identities, keep cache.
+        - If cache is already empty, keep empty (new user / no identities is valid).
+        """
+        if not self.use_mongodb or not self.mongodb_manager:
+            return False
+
+        now = time.monotonic()
+        if not force and self._db_refresh_interval_sec > 0:
+            if (now - self._last_db_refresh_at) < self._db_refresh_interval_sec:
+                return False
+
+        self._last_db_refresh_at = now
+        latest_faces = self.mongodb_manager.get_all_faces(self.user_id)
+        latest_count = len(latest_faces)
+        cached_count = len(self.face_database)
+
+        if latest_count > 0:
+            self.face_database = latest_faces
+            print(f"📂 Loaded {latest_count} identities from MongoDB (user: {self.user_id}, reason: {reason})")
+            return True
+
+        if cached_count == 0:
+            # Valid for new users with no identities.
+            self.face_database = latest_faces
+            print(f"📂 Loaded 0 identities from MongoDB (user: {self.user_id}, reason: {reason})")
+            return True
+
+        print(
+            f"⚠️ MongoDB returned 0 identities for user {self.user_id} (reason: {reason}); "
+            f"keeping cached {cached_count} identities"
+        )
+        return False
     
     def _save_database(self):
         """Save face embeddings database to MongoDB or disk"""
@@ -401,13 +442,10 @@ class FaceRecognizer:
         Returns:
             Dictionary with recognition results
         """
-        # Reload database from MongoDB before each recognition so that live
-        # add/delete operations are reflected immediately.  During batch video
-        # processing _skip_db_reload is set True so we only hit MongoDB once.
+        # Refresh face DB periodically so live updates are picked up, without
+        # hammering MongoDB on every frame/request during transient outages.
         if self.use_mongodb and self.mongodb_manager and not getattr(self, '_skip_db_reload', False):
-            print(f"🔄 Reloading face database from MongoDB for user: {self.user_id}...")
-            self.face_database = self.mongodb_manager.get_all_faces(self.user_id)
-            print(f"📂 Loaded {len(self.face_database)} identities for user {self.user_id}")
+            self._refresh_database_from_mongodb(force=False, reason="recognize")
         
         faces = self.detect_faces(image)
         
